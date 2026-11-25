@@ -1,0 +1,16 @@
+# Allow clearly non-secret hits so a clean public tree can scan to zero.
+# These are localStorage / preference key names, official published test
+# vectors, or documented test-only passwords used to build ciphertext fixtures.
+title = "Kallubi public export"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Local storage key names, official BIP32/BIP39 vectors, test-vector passwords"
+regexTarget = "secret"
+regexes = [
+  '''kallubi_[A-Za-z0-9_]+''',
+  '''ein-langes-[A-Za-z0-9-]+''',
+  '''xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi''',
+]

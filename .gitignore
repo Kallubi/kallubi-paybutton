@@ -1,0 +1,7 @@
+node_modules/
+__pycache__/
+.venv/
+.wrangler/
+tests/results-*.json
+shots/*
+!shots/README.md
