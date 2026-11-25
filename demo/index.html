@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>Kallubi Pay Button · Demo (test mode)</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Inter,system-ui,sans-serif;background:linear-gradient(160deg,#14141c 0%,#110f0c 55%,#1a1408 100%);color:#f8fafc;min-height:100vh;padding:32px 40px 40px;-webkit-font-smoothing:antialiased}
+header{display:flex;align-items:center;gap:14px;max-width:1180px;margin:0 auto 6px}
+h1{font-size:26px;font-weight:800;letter-spacing:-.02em}
+h1 span{background:linear-gradient(90deg,#f5d76e,#f0c14b 45%,#d4a017);-webkit-background-clip:text;background-clip:text;color:transparent}
+.tag{margin-left:auto;font-size:11.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#f0c14b;border:1px solid rgba(240,193,75,.25);padding:7px 12px;border-radius:999px;background:rgba(240,193,75,.06)}
+.sub{color:#a8a29e;font-size:14px;max-width:1180px;margin:0 auto 26px}
+.sub b{color:#fff3cf}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:28px;max-width:1180px;margin:0 auto}
+.panel{border-radius:20px;padding:22px 24px 26px}
+.panel.dark{background:rgba(20,20,28,.85);border:1px solid rgba(240,193,75,.18)}
+.panel.light{background:linear-gradient(160deg,#ffffff,#faf8f2);color:#14141c;border:1px solid rgba(184,134,11,.2)}
+.ph{display:flex;align-items:center;gap:10px;font-weight:700;font-size:15px;margin-bottom:16px}
+.ph code{font:600 11.5px ui-monospace,Menlo,monospace;padding:4px 8px;border-radius:6px;background:rgba(240,193,75,.14);color:#d4a017;border:1px solid rgba(240,193,75,.3)}
+.shop{border-radius:16px;overflow:hidden}
+.dark .shop{background:#1c1c24;border:1px solid rgba(255,255,255,.08)}
+.light .shop{background:#fff;border:1px solid #ece7da;box-shadow:0 18px 40px rgba(20,20,28,.08)}
+.bar{display:flex;align-items:center;gap:7px;padding:10px 14px;font-size:11.5px;color:#8b8b95}
+.dark .bar{border-bottom:1px solid rgba(255,255,255,.06)}.light .bar{border-bottom:1px solid #f0ebde}
+.dot{width:8px;height:8px;border-radius:50%;background:#3a3a44}.light .dot{background:#ddd6c6}
+.url{margin-left:8px;border-radius:6px;padding:3px 9px;flex:1}.dark .url{background:#121218}.light .url{background:#f6f3ea}
+.img{height:200px;display:grid;place-items:center;position:relative}
+.dark .img{background:linear-gradient(160deg,#26262f,#18181f)}.light .img{background:linear-gradient(160deg,#f3efe4,#e8e2d2)}
+.badge{position:absolute;top:12px;left:12px;font-size:10.5px;font-weight:700;padding:4px 8px;border-radius:6px}
+.dark .badge{background:rgba(255,255,255,.08);color:#d6d3d1}.light .badge{background:rgba(20,20,28,.06);color:#6b6459}
+.prod{padding:18px 20px 20px}
+.sn{font-size:11.5px;text-transform:uppercase;letter-spacing:.1em;font-weight:600;color:#9ca3af}.light .sn{color:#8a8274}
+.prod h3{font-size:20px;font-weight:700;margin:5px 0 3px}
+.desc{font-size:13px;line-height:1.5;color:#a1a1aa}.light .desc{color:#6b6459}
+.price{display:flex;align-items:baseline;gap:8px;margin:14px 0}.price b{font-size:24px;font-weight:800}.price span{font-size:12.5px;color:#9ca3af}
+.side{display:grid;grid-template-columns:1fr;gap:16px}
+.notes{font-size:13px;line-height:1.55;color:#a8a29e}.light .notes{color:#6b6459}
+.notes b{color:#fff3cf}.light .notes b{color:#14141c}
+.vars{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:16px}
+.log{max-width:1180px;margin:26px auto 0;background:#0b0b10;border:1px solid rgba(240,193,75,.16);border-radius:14px;padding:14px 18px;font:500 12.5px/1.6 ui-monospace,Menlo,monospace;color:#e7e5e4;min-height:60px;white-space:pre-wrap;word-break:break-all}
+.log b{color:#f0c14b}
+.code{max-width:1180px;margin:18px auto 0;background:#0b0b10;border:1px solid rgba(240,193,75,.16);border-radius:14px;padding:14px 18px;font:500 13px/1.7 ui-monospace,Menlo,monospace;color:#e7e5e4;white-space:pre;overflow:auto}
+footer{max-width:1180px;margin:18px auto 0;font-size:12px;color:#78716c;display:flex;justify-content:space-between}
+@media (max-width:980px){.grid{grid-template-columns:1fr}.side{grid-template-columns:1fr}body{padding:20px}}
+</style>
+</head>
+<body>
+<header><h1><span>Kallubi</span> Pay Button · Demo</h1><div class="tag">Test mode · no real money</div></header>
+<p class="sub">Two fake shops embed the same button. <b>Test mode</b> (<code>data-test="1"</code>) simulates a payment about 8 seconds after the dialog opens. The address is the well-known all-zero placeholder <b>1111111111111111111114oLvT2</b>, which nobody can spend from: never send real coins to it.</p>
+
+<div class="grid">
+ <section class="panel light" id="light-shop">
+  <div class="ph">White shop <code>data-theme="light"</code></div>
+  <div class="side">
+   <div class="shop">
+    <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="url">example-shop.test/product/tshirt</span></div>
+    <div class="img"><span class="badge">EXAMPLE</span>
+     <svg width="140" height="140" viewBox="0 0 100 100" aria-hidden="true"><path d="M34 14 L20 20 L8 36 L20 44 L26 38 L26 88 L74 88 L74 38 L80 44 L92 36 L80 20 L66 14 Q50 26 34 14Z" fill="#e4dccb" stroke="#cfc6b2" stroke-width="1.2"/><text x="50" y="62" text-anchor="middle" font-family="Inter,sans-serif" font-weight="800" font-size="9" fill="#a99f8b">EXAMPLE</text></svg></div>
+    <div class="prod"><div class="sn">Example Shop</div><h3>Basic T-Shirt</h3><div class="desc">Demo product. Organic cotton, unisex fit.</div>
+     <div class="price"><b>0.0005 BSV</b><span>· 50,000 sats</span></div>
+     <div id="btn-light" data-kallubi-pay data-confirm-above="0.01" data-to="1111111111111111111114oLvT2" data-amount="0.0005" data-label="Basic T-Shirt" data-merchant="Example Shop" data-order="EX-0001" data-theme="light" data-test="1" data-on-paid="demoPaid"></div>
+    </div>
+   </div>
+   <div class="notes"><b>White / off-white shop</b> with dark text and the same gold button. Darker gold (#b8860b) is used for text and links so they stay readable on white.
+    <div class="vars">
+     <div data-kallubi-pay data-confirm-above="0.01" data-to="1111111111111111111114oLvT2" data-amount="0.0005" data-label="Basic T-Shirt" data-merchant="Example Shop" data-theme="light" data-style="outline" data-size="sm" data-test="1"></div>
+     <div data-kallubi-pay data-confirm-above="0.01" data-to="1111111111111111111114oLvT2" data-amount="0.0005" data-label="Basic T-Shirt" data-merchant="Example Shop" data-theme="light" data-size="sm" data-show-amount="1" data-test="1"></div>
+    </div></div>
+  </div>
+ </section>
+
+ <section class="panel dark" id="dark-shop">
+  <div class="ph">Dark shop <code>data-theme="dark"</code></div>
+  <div class="side">
+   <div class="shop">
+    <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="url">night-shop.test/product/hoodie</span></div>
+    <div class="img"><span class="badge">EXAMPLE</span>
+     <svg width="140" height="140" viewBox="0 0 100 100" aria-hidden="true"><path d="M34 14 L20 20 L8 36 L20 44 L26 38 L26 88 L74 88 L74 38 L80 44 L92 36 L80 20 L66 14 Q50 26 34 14Z" fill="#2e2e38" stroke="#4a4a56" stroke-width="1.2"/><text x="50" y="62" text-anchor="middle" font-family="Inter,sans-serif" font-weight="800" font-size="9" fill="#6b6b76">EXAMPLE</text></svg></div>
+    <div class="prod"><div class="sn">Night Shop</div><h3>Gold Logo Hoodie</h3><div class="desc">Demo product. Heavy cotton, embroidered logo.</div>
+     <div class="price"><b>0.0012 BSV</b><span>· 120,000 sats</span></div>
+     <div id="btn-dark" data-kallubi-pay data-confirm-above="0.01" data-to="1111111111111111111114oLvT2" data-amount="0.0012" data-label="Gold Logo Hoodie" data-merchant="Night Shop" data-order="NS-1042" data-theme="dark" data-test="1" data-on-paid="demoPaid"></div>
+    </div>
+   </div>
+   <div class="notes"><b>Black background, gold accents.</b> Matches the Kallubi look. With <b>data-theme="auto"</b> the widget follows the visitor's light/dark system setting.
+    <div class="vars">
+     <div data-kallubi-pay data-confirm-above="0.01" data-to="1111111111111111111114oLvT2" data-amount="0.0012" data-label="Gold Logo Hoodie" data-merchant="Night Shop" data-theme="dark" data-style="outline" data-size="sm" data-test="1"></div>
+     <div data-kallubi-pay data-confirm-above="0.01" data-to="1111111111111111111114oLvT2" data-amount="0.0012" data-label="Gold Logo Hoodie" data-merchant="Night Shop" data-theme="auto" data-size="sm" data-show-amount="1" data-test="1"></div>
+    </div></div>
+  </div>
+ </section>
+</div>
+
+<div class="log" id="log"><b>kallubi:paid</b> events appear here (test mode simulates them).</div>
+<div class="code">&lt;script src="https://pay.kallubi-bsv-explorer.de/button.js" defer&gt;&lt;/script&gt;
+&lt;div data-kallubi-pay data-to="YOUR_BSV_ADDRESS" data-amount="0.0005" data-label="Basic T-Shirt" data-theme="auto" data-confirm-above="0.01"&gt;&lt;/div&gt;</div>
+<footer><span>Kallubi Pay Button v1.0.0 · local demo · all names, amounts and transaction IDs are fake</span><span>Non-custodial · no cookies · no tracking</span></footer>
+
+<script>
+  // merchant-side hooks (both are optional)
+  function demoPaid(d) { window.__lastCallback = d; }
+  document.addEventListener('kallubi:paid', function (e) {
+    var d = e.detail, log = document.getElementById('log');
+    window.__paidEvents = (window.__paidEvents || []).concat([d]);
+    var line = document.createElement('div');
+    line.textContent = new Date().toLocaleTimeString() + '  kallubi:paid  ' + JSON.stringify(d);
+    log.appendChild(line);
+  });
+</script>
+<script src="../dist/button.min.js" defer></script>
+</body>
+</html>

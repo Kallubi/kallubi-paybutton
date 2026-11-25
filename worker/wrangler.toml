@@ -1,0 +1,17 @@
+# Kallubi Pay check proxy. NOT DEPLOYED. Deploy only with the maintainer's explicit OK.
+# No account_id / routes on purpose. Before going live add e.g.:
+#   routes = [{ pattern = "pay.kallubi-bsv-explorer.de/api/pay/*", zone_name = "kallubi-bsv-explorer.de" }]
+name = "kallubi-pay-check"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+# 30 checks per minute per client (≈ one dialog polling every 5 s, with headroom)
+[[ratelimits]]
+name = "PAY_RL"
+namespace_id = "4711"
+  [ratelimits.simple]
+  limit = 30
+  period = 60
+
+# Optional: wrangler secret put WOC_API_KEY   (higher WhatsOnChain quota)

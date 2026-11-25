@@ -1,0 +1,11 @@
+Kallubi Pay Button
+Copyright 2026 The Kallubi Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The name "Kallubi" and the Kallubi logo are NOT licensed under the Apache License.
+You may not use them to suggest that a fork or a modified version is made or endorsed by Kallubi.
+
+Third-party component (bundled unmodified in dist/ and vendor/):
+  - qrcode-generator 1.4.4, MIT License, Copyright (c) 2009 Kazuhiko Arase
+    (https://github.com/kazuhikoarase/qrcode-generator). Its license header is kept in vendor/.
