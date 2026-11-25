@@ -1,0 +1,5 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Kallubi Pay – test fixture</title></head>
+<body><div id="slot"></div>
+<script src="../dist/button.min.js"></script>
+<script>window.__ev=[];['kallubi:paid','kallubi:seen','kallubi:dropped'].forEach(function(n){document.addEventListener(n,function(e){window.__ev.push({type:n,d:e.detail,id:(e.target.closest&&e.target.closest('[id]')||{}).id})})});</script>
+</body></html>
