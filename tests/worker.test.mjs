@@ -1,21 +1,23 @@
 // Node tests for the (not deployed) check worker: mocked WoC + one live read-only check.
 import http from 'node:http';
 import assert from 'node:assert/strict';
-import worker, { addressScript, satsToScript } from '../worker/src/index.js';
+import worker, { addressScript, satsToScript, clientKey, rateSalt } from '../worker/src/index.js';
+import { createHash } from 'node:crypto';
 
 const results = []; const ok = (n) => { results.push(['PASS', n]); console.log('PASS', n); };
 const ADDR = '1111111111111111111114oLvT2';                    // all-zero hash160 placeholder
 const SCRIPT = '76a914' + '00'.repeat(20) + '88ac';
 const now = Math.floor(Date.now() / 1000);
 const tx = (id, sats, extra) => ({ txid: id, confirmations: 0, vout: [{ value: sats / 1e8, scriptPubKey: { hex: SCRIPT } }, { value: 1, scriptPubKey: { hex: '76a914' + '11'.repeat(20) + '88ac' } }], ...extra });
-const A = 'a'.repeat(64), B = 'b'.repeat(64), C = 'c'.repeat(64);
+const A = 'a'.repeat(64), B = 'b'.repeat(64), C = 'c'.repeat(64), D = 'd'.repeat(64);
 let mode = 'ok';
-const TX = { [A]: tx(A, 50037), [B]: tx(B, 50036), [C]: tx(C, 99999, { confirmations: 3, blocktime: now - 86400 }) };
+const TX = { [A]: tx(A, 50037), [B]: tx(B, 50036), [C]: tx(C, 99999, { confirmations: 3, blocktime: now - 86400 }), [D]: tx(D, 77777, { confirmations: 2 }) };
 const srv = http.createServer((q, r) => {
   if (mode === '429') { r.writeHead(429); return r.end(); }
   const u = q.url;
   let body = null;
-  if (u.includes('/unconfirmed/history')) body = { result: [{ tx_hash: A }, { tx_hash: B }] };
+  if (mode === 'txhtml' && u.includes('/tx/hash/')) { r.writeHead(200, { 'Content-Type': 'text/html' }); return r.end('<html>429 Too Many Requests</html>'); }
+  if (u.includes('/unconfirmed/history')) body = { result: [{ tx_hash: A }, { tx_hash: B }].concat(mode === 'nobt' ? [{ tx_hash: D }] : []) };
   else if (u.includes('/confirmed/history')) body = { result: [{ tx_hash: C, height: 1 }] };
   else { const m = u.match(/\/tx\/hash\/([0-9a-f]{64})/); if (m && TX[m[1]]) body = TX[m[1]]; }
   if (!body) { r.writeHead(404); return r.end(); }
@@ -32,14 +34,39 @@ ok('worker: rejects garbage / bad checksum / P2SH / bech32 / html');
 let [s, j, r] = await call('to=' + ADDR + '&amount=50037&since=' + now);
 assert.equal(s, 200); assert.deepEqual(j.matches.map((m) => m.txid), [A]); ok('worker: exact unique amount matches only tx A (B is 1 sat short, C is too old)');
 assert.equal(r.headers.get('access-control-allow-origin'), '*'); assert.equal(r.headers.get('set-cookie'), null); ok('worker: CORS *, no cookies');
+[s, j] = await call('to=' + ADDR + '&amount=50000&since=0&match=min');
+assert.deepEqual(j.matches.map((m) => m.txid).sort(), [A, B, C].sort()); assert.ok(j.matches.every((m) => !m.overpaid && m.exact === false)); ok('worker: match=min (opt-in) + since=0 + lower amount -> all three (pre-1.3 rule)');
+// v1.3.0 exact-amount: default match=exact. Two buyers pay the same address: invoice 50036 (buyer B) must not be satisfied by A's 50037.
+[s, j] = await call('to=' + ADDR + '&amount=50036&since=' + now);
+assert.equal(s, 200); assert.deepEqual(j.matches.filter((m) => !m.overpaid).map((m) => m.txid), [B]);
+assert.deepEqual(j.matches.filter((m) => m.overpaid).map((m) => m.txid), [A]); assert.ok(j.matches.find((m) => m.txid === B).exact === true);
+ok('worker v1.3.0 exact-amount: two buyers, exact default -> only the exact tx is a match; the larger one is flagged overpaid, never a match');
 [s, j] = await call('to=' + ADDR + '&amount=50000&since=0');
-assert.deepEqual(j.matches.map((m) => m.txid).sort(), [A, B, C].sort()); ok('worker: since=0 + lower amount -> all three');
+assert.ok(j.matches.length === 3 && j.matches.every((m) => m.overpaid === true)); ok('worker v1.3.0 exact-amount: lower invoice amount, exact default -> all three only as overpaid');
+[s, j] = await call('to=' + ADDR + '&amount=50037&since=0&match=more'); assert.equal(s, 400); assert.equal(j.error, 'bad_match'); ok('worker v1.3.0: unknown match mode -> 400');
 [s, j] = await call('to=garbage&amount=1&since=0'); assert.equal(s, 400); assert.equal(j.error, 'bad_address'); ok('worker: 400 bad_address');
 [s, j] = await call('to=' + ADDR + '&amount=0.5&since=0'); assert.equal(s, 400); ok('worker: 400 bad_amount (sats must be integer)');
+// v1.3.0 status fail-closed (26.11.): HTML instead of JSON for a tx, or a confirmed tx without block time, is never a match
+mode = 'txhtml'; [s, j] = await call('to=' + ADDR + '&amount=50037&since=0'); mode = 'ok';
+assert.equal(s, 200); assert.deepEqual(j.matches, []); ok('worker v1.3.0: tx status answered with HTML (rate limit page) -> no match, no crash');
+mode = 'nobt'; [s, j] = await call('to=' + ADDR + '&amount=77777&since=0'); mode = 'ok';
+assert.equal(s, 200); assert.ok(!j.matches.some((m) => m.txid === D)); ok('worker v1.3.0: confirmed tx without block time (age unknown) -> no match');
 mode = '429'; [s, j, r] = await call('to=' + ADDR + '&amount=1&since=0'); assert.equal(s, 503); assert.equal(r.headers.get('retry-after'), '10'); ok('worker: WoC 429 -> 503 + Retry-After'); mode = 'ok';
 const rl = { limit: async () => ({ success: false }) };
 [s, j] = await call('to=' + ADDR + '&amount=1&since=0', { ...env, PAY_RL: rl }); assert.equal(s, 429); ok('worker: rate-limit binding enforced');
 srv.close();
+// v1.3.0 smaller note: rate-limit salt is secret / random, the key cannot be recomputed from a known IP
+{
+  const req = new Request('https://x.test/api/pay/check', { headers: { 'CF-Connecting-IP': '203.0.113.7' } });
+  const day = new Date().toISOString().slice(0, 10);
+  const oldKey = createHash('sha256').update('kallubi-pay|' + day + '|203.0.113.7').digest('hex');
+  const k1 = await clientKey(req, {}), k2 = await clientKey(req, {});
+  assert.notEqual(k1, oldKey); assert.equal(k1, k2); assert.match(rateSalt({}), /^[0-9a-f]{64}$/);
+  ok('worker v1.3.0: without RL_SALT a random per-isolate salt is used (stable in the isolate, not the old fixed salt)');
+  const sec = 'x'.repeat(40), k3 = await clientKey(req, { RL_SALT: sec });
+  assert.equal(k3, createHash('sha256').update(sec + '|' + day + '|203.0.113.7').digest('hex')); assert.notEqual(k3, k1);
+  assert.equal(rateSalt({ RL_SALT: 'short' }), rateSalt({})); ok('worker v1.3.0: RL_SALT secret (>= 32 chars) is used; a too short one is ignored');
+}
 
 // ---- live, read-only check against WhatsOnChain mainnet (no spending, public data only)
 const LIVE = '1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa';

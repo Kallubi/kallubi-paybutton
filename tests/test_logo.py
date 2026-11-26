@@ -23,7 +23,7 @@ with sync_playwright() as pw:
     b = pw.chromium.launch(executable_path='/usr/bin/google-chrome')
     pg = b.new_page(viewport={'width': 1280, 'height': 900}, device_scale_factor=2)
     pg.goto('http://127.0.0.1:8765/demo/'); pg.wait_for_function('document.querySelectorAll(".kallubi-pay-host").length >= 6')
-    check('version 1.2.0', pg.evaluate('window.KallubiPay && KallubiPay.version') == '1.2.0', pg.evaluate('window.KallubiPay && KallubiPay.version'))
+    check('version 1.3.0', pg.evaluate('window.KallubiPay && KallubiPay.version') == '1.3.0', pg.evaluate('window.KallubiPay && KallubiPay.version'))
     for theme in ('dark', 'light'):
         lg = pg.evaluate("(f) => (eval(f))(document.querySelector('#btn-%s .kallubi-pay-host').shadowRoot)" % theme, LOGOS)
         check(theme + ' button: "Powered by Kallubi" mark is the real logo', len(lg) == 1 and lg[0]['d'] == [KPATH] and lg[0]['stops'] == 7, lg)

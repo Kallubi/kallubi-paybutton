@@ -1,4 +1,4 @@
-/* Kallubi Pay · server-side payment verification for shops · v1.2.0 · Apache-2.0
+/* Kallubi Pay · server-side payment verification for shops · v1.3.0 · Apache-2.0
  *
  * Why this exists: the browser events of the Pay Button (kallubi:paid, data-on-paid) are UX only. Anyone who controls a
  * browser can fire them with made-up data. A shop must decide "paid" on its OWN server, from the blockchain, never from
@@ -7,8 +7,9 @@
  * What verifyPayment() checks
  *   1. It downloads the RAW transaction (WhatsOnChain or your own BSV node via RPC) and checks that its double-SHA256
  *      equals the txid. The amounts come from parsing these raw bytes, not from anybody's JSON.
- *   2. The outputs that pay your address (mainnet P2PKH) add up to the expected amount
- *      (exactSats = must match exactly, recommended; or minSats = at least).
+ *   2. The outputs that pay your address (mainnet P2PKH) add up to the expected amount.
+ *      exactSats = must match exactly. This is the STANDARD (v1.3.0) and the only mode that binds a payment to one order
+ *      when several buyers pay the same address. minSats (= at least) is a legacy opt-in for shops without unique amounts.
  *   3. Confirmation policy (same as the button): the threshold is an EUR amount (zeroConfUpToCents, default 200.00).
  *      With a passed quick check (own node + BSV Broadcaster, final tx, sufficient fee, no double-spend in a 5 s window)
  *      amounts up to that line are accepted at 0-conf; above it 1 confirmation is required. If the quick check is
@@ -19,6 +20,10 @@
  *   4. Expiry: a payment the server only sees after expiresAt is reported as status 'late' (not paid) unless acceptLate.
  *   5. Replay protection: one txid can pay ONE order only (claims store, e.g. a UNIQUE(txid) column in your database).
  *
+ * v1.3.0 hardening: raw tx size is checked BEFORE hashing (default max 1 MB, option maxTxBytes); every response body is
+ * read with a streaming byte cap; an RPC source must be https:// (http:// only for localhost / 127.0.0.1 / [::1]);
+ * fetchRate() needs two fresh sources that agree within 3 % (minSources: 1 = old single-source behaviour).
+ *
  * Trust note (honest): the raw bytes are verified, so a data source cannot invent or change amounts. Whether the
  * transaction exists / is confirmed is reported by the source. Use your own node (rpc) or wait for confirmations for
  * high amounts. 0-conf on BSV is first-seen and never 100 % safe: a competing double-spend can still appear after the
@@ -26,13 +31,14 @@
  */
 import { createHash, randomInt } from 'node:crypto';
 
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';
 const WOC = 'https://api.whatsonchain.com/v1/bsv/main';
 const CG = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin-cash-sv&vs_currencies=eur,usd&include_last_updated_at=true';
 const MAX_SATS = 2100000000000000;
-const MAX_TX_BYTES = 10 * 1024 * 1024;       // 10 MB raw tx is far above anything a shop payment needs
+export const MAX_TX_BYTES = 1024 * 1024;      // v1.3.0: 1 MB raw tx is far above anything a shop payment needs (was 10 MB)
 const OLD_SLACK_S = 7200;                    // block timestamps may be off by up to ~2 h (consensus rules)
-const RATE_MAX_AGE_S = 600, RATE_FUTURE_S = 300, RATE_MAX = 10000000;
+const RATE_MAX_AGE_S = 600, RATE_FUTURE_S = 300, RATE_MAX = 100000, RATE_MIN = 0.5;   // v1.3.0: tighter plausibility bounds
+export const RATE_MAX_DEV_PCT = 3;             // v1.3.0: two rate sources must agree within 3 %
 const ECB_XML = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml';   // official ECB reference rates (daily)
 const ECB_MAX_AGE_D = 5, ECB_CACHE_S = 3600, ECB_MIN = 0.5, ECB_MAX = 2;
 export const ZERO_CONF_UP_TO_CENTS = 20000;              // 200.00 EUR (with a passed quick check)
@@ -68,8 +74,8 @@ export function addressToScript(addr) {
 export function txidFromRaw(hex) { return Buffer.from(sha256(sha256(Buffer.from(hex, 'hex')))).reverse().toString('hex'); }
 
 /** Strict raw transaction parser. Throws on anything malformed (truncated, trailing bytes, absurd counts). */
-export function parseRawTx(hex) {
-  if (typeof hex !== 'string' || !hex.length || hex.length % 2 || !/^[0-9a-fA-F]+$/.test(hex) || hex.length / 2 > MAX_TX_BYTES) throw new Error('bad_hex');
+export function parseRawTx(hex, maxBytes = MAX_TX_BYTES) {
+  if (typeof hex !== 'string' || !hex.length || hex.length % 2 || hex.length / 2 > maxBytes || !/^[0-9a-fA-F]+$/.test(hex)) throw new Error('bad_hex');
   const b = Buffer.from(hex, 'hex'); let o = 0;
   const need = (n) => { if (o + n > b.length) throw new Error('truncated'); };
   const u32 = () => { need(4); const v = b.readUInt32LE(o); o += 4; return v; };
@@ -122,16 +128,47 @@ export function minSatsFromFiat(cents, rate, tolerancePct = 2) {
 }
 export function rateMicro(r) {
   const n = typeof r === 'number' ? r : (typeof r === 'string' && /^\d{1,8}(\.\d{1,12})?$/.test(r) ? Number(r) : NaN);
-  if (!Number.isFinite(n) || n <= 0 || n > RATE_MAX) return null;
+  if (!Number.isFinite(n) || n < RATE_MIN || n > RATE_MAX) return null;
   const u = Math.round(n * 1e6); return u >= 1 ? u : null;
 }
+/** v1.3.0: two rates agree when they differ by at most maxPct of the smaller one (integer micro units) */
+export function ratesAgree(a, b, maxPct = RATE_MAX_DEV_PCT) {
+  const x = rateMicro(a), y = rateMicro(b);
+  if (x == null || y == null) return false;
+  const lo = Math.min(x, y), hi = Math.max(x, y);
+  return (hi - lo) * 100 <= lo * maxPct;
+}
+/** v1.3.0 (verify-limits): read a response body with a hard byte cap. Uses the stream when there is one (aborts as soon as the cap is
+ *  passed, so a huge or endless body never fills memory); Content-Length above the cap is refused before reading. */
+export async function readCapped(r, maxBytes) {
+  const cl = Number(r.headers && typeof r.headers.get === 'function' ? r.headers.get('content-length') : NaN);
+  if (Number.isFinite(cl) && cl > maxBytes) { try { if (r.body && r.body.cancel) await r.body.cancel(); } catch (e) { /* ignore */ } throw Object.assign(new Error('too_large'), { code: 'too_large' }); }
+  if (r.body && typeof r.body.getReader === 'function') {
+    const rd = r.body.getReader(), parts = []; let n = 0;
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      n += value.byteLength;
+      if (n > maxBytes) { try { await rd.cancel(); } catch (e) { /* ignore */ } throw Object.assign(new Error('too_large'), { code: 'too_large' }); }
+      parts.push(value);
+    }
+    return Buffer.concat(parts.map((p) => Buffer.from(p.buffer, p.byteOffset, p.byteLength))).toString('utf8');
+  }
+  const t = await r.text();
+  if (t.length > maxBytes) throw Object.assign(new Error('too_large'), { code: 'too_large' });
+  return t;
+}
+const JSON_CAP = MAX_TX_BYTES * 2 + 65536;     // JSON answers (status, history, policy, RPC) never need more than this
+const isLocalUrl = (u) => /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/i.test(u);
+/** v1.3.0 (verify-limits): only https:// sources, plain http only for a node on the same machine */
+export function sourceUrlOk(u) { return typeof u === 'string' && (/^https:\/\/[^\s]+$/i.test(u) || isLocalUrl(u)); }
 export function fmtBsv(sats) { const s = String(sats).padStart(9, '0'); const f = s.slice(-8).replace(/0+$/, ''); return s.slice(0, -8) + (f ? '.' + f : ''); }
 
 async function getJson(url, f, headers) {
   const r = await f(url, { headers: { Accept: 'application/json', ...(headers || {}) }, redirect: 'error', signal: AbortSignal.timeout(10000) });
   if (r.status === 404) return { status: 404 };
   if (!r.ok) return { status: r.status };
-  const t = await r.text(); if (t.length > MAX_TX_BYTES * 2 + 4096) return { status: 502 };
+  let t; try { t = await readCapped(r, JSON_CAP); } catch (e) { return { status: 502 }; }
   return { status: 200, body: JSON.parse(t), text: t };
 }
 
@@ -152,7 +189,7 @@ async function fetchEcb(f, now, url) {
   if (ecbCache && ecbCache.url === url && now - ecbCache.at >= 0 && now - ecbCache.at < ECB_CACHE_S && parseEcbXml(ecbCache.xml, now)) return parseEcbXml(ecbCache.xml, now);
   const r = await f(url, { headers: { Accept: 'application/xml' }, redirect: 'error', signal: AbortSignal.timeout(10000) });
   if (!r.ok) throw new Error('ecb');
-  const xml = await r.text(), v = parseEcbXml(xml, now);
+  const xml = await readCapped(r, 200000), v = parseEcbXml(xml, now);
   if (!v) throw new Error('ecb');
   ecbCache = { url, xml, at: now };
   return v;
@@ -224,25 +261,38 @@ export function requiredConfirmations({
   return sats > fb ? 1 : 0;
 }
 
-/** Current fiat rate on YOUR server: CoinGecko (EUR, USD) first. Backup: USD = WhatsOnChain; EUR = WhatsOnChain USD divided by
- *  the official ECB EUR/USD reference rate (daily XML, cached 1 h). Refuses stale data. backup: false = CoinGecko only. */
-export async function fetchRate(currency, { fetchImpl = fetch, now = Math.floor(Date.now() / 1000), cgUrl = CG, wocBase = WOC, ecbUrl = ECB_XML, backup = true } = {}) {
+/** Current fiat rate on YOUR server. v1.3.0: CoinGecko (EUR, USD) AND the second source (USD = WhatsOnChain; EUR = WhatsOnChain
+ *  USD divided by the official ECB EUR/USD reference rate, daily XML, cached 1 h) are asked in parallel. Both must be fresh and
+ *  agree within maxDeviationPct (default 3 %); the CoinGecko rate is returned. minSources: 1 accepts a single source (the
+ *  pre-1.3 behaviour). backup: false = CoinGecko only (then needs minSources: 1). Refuses stale data. */
+export async function fetchRate(currency, { fetchImpl = fetch, now = Math.floor(Date.now() / 1000), cgUrl = CG, wocBase = WOC, ecbUrl = ECB_XML, backup = true,
+  minSources = 2, maxDeviationPct = RATE_MAX_DEV_PCT } = {}) {
   const cur = String(currency || '').toUpperCase();
   if (cur !== 'EUR' && cur !== 'USD') throw new RangeError('currency');
+  if (minSources !== 1 && minSources !== 2) throw new RangeError('minSources');
+  if (!(maxDeviationPct > 0 && maxDeviationPct <= 10)) throw new RangeError('maxDeviationPct');
   const fresh = (v, t, source) => { const m = rateMicro(v), ts = Number(t);
     return m != null && Number.isSafeInteger(ts) && ts > 0 && now - ts <= RATE_MAX_AGE_S && ts - now <= RATE_FUTURE_S ? { rate: m / 1e6, rateTime: ts, source } : null; };
-  try { const j = await getJson(cgUrl, fetchImpl); const o = j.body && j.body['bitcoin-cash-sv'];
-    const r = o && fresh(o[cur.toLowerCase()], o.last_updated_at, 'coingecko'); if (r) return r; } catch (e) { /* fall through */ }
-  if (!backup) throw new Error('no_fresh_rate');
-  let usd = null;
-  try { const j = await getJson(wocBase + '/exchangerate', fetchImpl); usd = j.body && j.body.currency === 'USD' && fresh(j.body.rate, j.body.time, 'whatsonchain') || null; } catch (e) { /* none */ }
-  if (usd && cur === 'USD') return usd;
-  if (usd) {
+  const cgP = (async () => { try { const j = await getJson(cgUrl, fetchImpl); const o = j.body && j.body['bitcoin-cash-sv'];
+    return (o && fresh(o[cur.toLowerCase()], o.last_updated_at, 'coingecko')) || null; } catch (e) { return null; } })();
+  const secondP = !backup ? Promise.resolve(null) : (async () => {
+    let usd = null;
+    try { const j = await getJson(wocBase + '/exchangerate', fetchImpl); usd = j.body && j.body.currency === 'USD' && fresh(j.body.rate, j.body.time, 'whatsonchain') || null; } catch (e) { /* none */ }
+    if (!usd) return null;
+    if (cur === 'USD') return usd;
     try { const e = await fetchEcb(fetchImpl, now, ecbUrl);
       const r = fresh(usd.rate / e.usdPerEur, usd.rateTime, 'whatsonchain+ecb');
       if (r) return { ...r, usdRate: usd.rate, ecbRate: e.usdPerEur, ecbDate: e.date }; } catch (e) { /* none */ }
+    return null;
+  })();
+  const [a, b] = await Promise.all([cgP, secondP]);
+  // v1.3.0 (rate-check): both answered -> they must agree within maxDeviationPct, else no rate at all (one source may be wrong)
+  if (a && b) {
+    if (!ratesAgree(a.rate, b.rate, maxDeviationPct)) throw Object.assign(new Error('rate_mismatch'), { code: 'rate_mismatch', rates: [a.rate, b.rate] });
+    return { ...a, checkedBy: b.source, checkRate: b.rate, sources: 2 };
   }
-  throw new Error('no_fresh_rate');
+  if (minSources === 1 && (a || b)) return { ...(a || b), sources: 1 };
+  throw new Error(a || b ? 'single_rate_source' : 'no_fresh_rate');
 }
 
 /** Server-made quote (recommended): the SERVER decides the exact amount incl. a random tag that is unique among open
@@ -292,14 +342,14 @@ export async function runQuickCheck({ txid, hex, source, fetchImpl, broadcasters
     if (t.status !== 200) return qcResult({ ok: false, reason: 'source_error' });
     hex = t.hex;
   }
-  if (typeof hex !== 'string' || !/^[0-9a-fA-F]+$/.test(hex) || txidFromRaw(hex) !== txid) return qcResult({ ok: false, reason: 'hex' });
+  if (typeof hex !== 'string' || hex.length > MAX_TX_BYTES * 2 || !/^[0-9a-fA-F]+$/.test(hex) || txidFromRaw(hex) !== txid) return qcResult({ ok: false, reason: 'hex' });
   let tx; try { tx = parseRawTx(hex); } catch (e) { return qcResult({ ok: false, reason: 'hex' }); }
   if (!isTxFinal(tx, now, tipHeight)) return qcResult({ ok: false, reason: 'not_final', hard: true });
   if (tx.inputs.length > maxInputs) return qcResult({ ok: false, reason: 'fee_unknown' });
   let inS = 0;
   for (const inp of tx.inputs) {
     let p; try { p = await loadTx(inp.prevTxid, source, f); } catch (e) { p = null; }
-    if (!p || p.status !== 200 || !/^[0-9a-fA-F]+$/.test(p.hex || '') || txidFromRaw(p.hex) !== inp.prevTxid) return qcResult({ ok: false, reason: 'fee_unknown' });
+    if (!p || p.status !== 200 || typeof p.hex !== 'string' || p.hex.length > MAX_TX_BYTES * 2 || !/^[0-9a-fA-F]+$/.test(p.hex) || txidFromRaw(p.hex) !== inp.prevTxid) return qcResult({ ok: false, reason: 'fee_unknown' });
     let ptx; try { ptx = parseRawTx(p.hex); } catch (e) { return qcResult({ ok: false, reason: 'fee_unknown' }); }
     const out = ptx.outputs[inp.vout]; if (!out) return qcResult({ ok: false, reason: 'bad_amounts', hard: true });
     inS += out.sats;
@@ -319,7 +369,7 @@ export async function runQuickCheck({ txid, hex, source, fetchImpl, broadcasters
     let r;
     try { r = await f(root + '/tx', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: hex, redirect: 'error', signal: AbortSignal.timeout(12000) }); }
     catch (e) { continue; }
-    let body = null; try { body = JSON.parse(await r.text()); } catch (e) { body = null; }
+    let body = null; try { body = JSON.parse(await readCapped(r, JSON_CAP)); } catch (e) { body = null; }
     if (!r.ok) continue;
     let last = qcStatus(body);
     while (!last.bad && Date.now() - started < watchMs) {
@@ -342,22 +392,26 @@ export class MemoryClaims {
 async function loadTx(txid, source, f) {
   if (source && source.rpc) {
     const { url, user, password } = source.rpc;
-    if (typeof url !== 'string' || !/^https?:\/\//.test(url)) throw Object.assign(new Error('bad rpc url'), { code: 'bad_input' });
+    // v1.3.0 (verify-limits): RPC credentials only over https://, plain http only to a node on the same machine
+    if (!sourceUrlOk(url)) throw Object.assign(new Error('bad rpc url'), { code: 'bad_input' });
     const headers = { 'Content-Type': 'application/json' };
     if (user != null) headers.Authorization = 'Basic ' + Buffer.from(user + ':' + (password || '')).toString('base64');
     const r = await f(url, { method: 'POST', headers, redirect: 'error', signal: AbortSignal.timeout(15000),
       body: JSON.stringify({ jsonrpc: '1.0', id: 'kallubi-verify', method: 'getrawtransaction', params: [txid, 1] }) });
-    const t = await r.text(); let j = null; try { j = JSON.parse(t); } catch (e) { /* below */ }
+    let t = ''; try { t = await readCapped(r, JSON_CAP); } catch (e) { return { status: 502, tooLarge: true }; }
+    let j = null; try { j = JSON.parse(t); } catch (e) { /* below */ }
     if (j && j.error && (j.error.code === -5)) return { status: 404 };          // no such tx (mempool / index)
     if (!r.ok || !j || j.error || !j.result) return { status: r.status || 502 };
     return { status: 200, hex: String(j.result.hex || ''), confirmations: Number(j.result.confirmations) || 0, blocktime: Number(j.result.blocktime) || 0, statusOk: true, source: 'rpc' };
   }
   const base = (source && source.woc) || WOC;
+  if (!sourceUrlOk(base)) throw Object.assign(new Error('bad source url'), { code: 'bad_input' });
   const headers = source && source.apiKey ? { 'woc-api-key': source.apiKey } : {};
   const r = await f(base + '/tx/' + txid + '/hex', { headers, redirect: 'error', signal: AbortSignal.timeout(10000) });
   if (r.status === 404) return { status: 404 };
   if (!r.ok) return { status: r.status };
-  const hex = (await r.text()).trim().replace(/^"|"$/g, '');
+  let raw; try { raw = await readCapped(r, MAX_TX_BYTES * 2 + 16); } catch (e) { return { status: 502, tooLarge: true }; }
+  const hex = raw.trim().replace(/^"|"$/g, '');
   // status only (confirmations / block time); amounts never come from this JSON
   const s = await getJson(base + '/tx/hash/' + txid, f, headers).catch(() => ({ status: 502 }));
   const st = s.status === 200 && s.body ? s.body : {};
@@ -417,7 +471,10 @@ export async function verifyPayment(o = {}) {
   let t;
   try { t = await loadTx(txid, o.source, f); } catch (e) { return e && e.code === 'bad_input' ? bad('source') : { ...base, status: 'source_error' }; }
   if (t.status === 404) return { ...base, status: 'not_found' };
+  if (t.tooLarge) return { ...base, status: 'bad_tx', reason: 'too_large' };
   if (t.status !== 200) return { ...base, status: 'source_error', http: t.status };
+  // v1.3.0 (verify-limits): size first, then the cheap hex check, only then hashing
+  if (typeof t.hex !== 'string' || t.hex.length > MAX_TX_BYTES * 2) return { ...base, status: 'bad_tx', reason: 'too_large' };
   if (!/^[0-9a-fA-F]+$/.test(t.hex) || txidFromRaw(t.hex) !== txid) return { ...base, status: 'txid_mismatch' };
   let tx; try { tx = parseRawTx(t.hex); } catch (e) { return { ...base, status: 'bad_tx', reason: e.message }; }
   // A non-final transaction (nSequence / nLockTime) must not be accepted at 0-conf.
@@ -432,6 +489,8 @@ export async function verifyPayment(o = {}) {
   }
   // fail closed: without a status answer we cannot check age or confirmations
   if (!t.statusOk && (o.createdAt || minConf > 0)) return { ...base, status: 'source_error', reason: 'status_unavailable' };
+  // fail closed: a confirmed tx without block time cannot be checked against createdAt / expiresAt
+  if (t.statusOk && t.confirmations > 0 && !t.blocktime && (o.createdAt || o.expiresAt)) return { ...base, status: 'source_error', reason: 'blocktime_unavailable' };
   const info = { ...base, quickCheck: quickCheck || undefined, paidSats: paid, expectedSats: expected, confirmations: t.confirmations, requiredConfirmations: minConf, blocktime: t.blocktime || null, source: t.source, final: isTxFinal(tx, now, o.tipHeight) };
   if (paid < expected) return { ...info, status: 'underpaid' };
   if (exact && paid > expected) return { ...info, status: 'overpaid' };          // exact amount is the order binding; review by hand

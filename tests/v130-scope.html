@@ -1,0 +1,8 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Kallubi Pay v1.3.0 – mount scope fixture</title></head>
+<body>
+<div id="shop"><div id="in" data-kallubi-pay data-to="1111111111111111111114oLvT2" data-amount="0.0005" data-test="1"></div></div>
+<div id="reviews"><div id="out" data-kallubi-pay data-to="1111111111111111111114oLvT2" data-amount="0.00000001"></div></div>
+<div id="slot"></div>
+<script src="../dist/button.min.js" data-mount="#shop"></script>
+<script>window.__ev=[];['kallubi:paid','kallubi:seen','kallubi:dropped','kallubi:overpaid','kallubi:shipping','kallubi:late','kallubi:expired'].forEach(function(n){document.addEventListener(n,function(e){window.__ev.push({type:n,d:e.detail,id:(e.target.closest&&e.target.closest('[id]')||{}).id})})});</script>
+</body></html>

@@ -1,6 +1,6 @@
 # Kallubi Pay Button – Anleitung (Deutsch)
 
-Version 1.2.0 · Lizenz Apache-2.0 · [English README](README.md)
+Version 1.3.0 · Lizenz Apache-2.0 · [English README](README.md)
 
 > **Haftungshinweis:** Die Software wird **„wie sie ist“ und ohne jede Gewährleistung** bereitgestellt (Apache-2.0, Abschnitte 7
 > und 8). Die Nutzung erfolgt **auf eigene Verantwortung**. Kallubi hat **nie Zugriff auf Gelder**: Käufer zahlen direkt an die
@@ -17,10 +17,19 @@ Kallubi bekommt kein Geld in die Hand, kennt keine Schlüssel und speichert nich
 ## So sieht der Code für einen Shop aus
 
 ```html
-<script src="https://pay.kallubi-bsv-explorer.de/button.js" defer></script>
+<script src="https://pay.kallubi-bsv-explorer.de/v/1.3.0/button.min.js"
+        integrity="sha384-RN5EDUvjdODos1TI96IMyGAIBGUJmvv9CqYa/D4reDQf18iICiRErukOjqPwb4R8" crossorigin="anonymous"
+        data-allowed-to="1DEINE_BSV_ADRESSE" defer></script>
 <div data-kallubi-pay data-to="1DEINE_BSV_ADRESSE" data-amount="0.0005"
      data-label="Basic T-Shirt" data-theme="auto"></div>
 ```
+
+- **Neu in 1.3.0:** Die Datei mit Versionsnummer (`/v/1.3.0/…`) ändert sich nie. `integrity` ist ihr Fingerabdruck: Wäre
+  auch nur ein Zeichen anders, lädt der Browser sie nicht. Die alte Adresse `/button.js` funktioniert weiter und liefert
+  immer die neueste Version (dann ohne Fingerabdruck).
+- `data-allowed-to` (im `<script>`-Tag) = die BSV-Adresse(n), an die Knöpfe auf dieser Seite zahlen dürfen (mehrere mit Komma).
+  Ein Knopf mit einer anderen Adresse zeigt einen Fehler statt QR-Code. Das schützt, wenn fremde Leute HTML auf die Seite
+  bringen können (Kommentare, Bewertungen, Plugins). Mit `data-mount="#shop"` werden nur Knöpfe in diesem Bereich aktiv.
 
 - `data-to` = BSV-Adresse des Shops (beginnt mit „1“). Eine falsche Adresse wird erkannt, dann erscheint eine Warnung statt des
   Knopfs. Eine Testnet-/STN-Adresse oder eine P2SH-Adresse („3…“) wird gesondert gemeldet.
@@ -33,8 +42,9 @@ Kallubi bekommt kein Geld in die Hand, kennt keine Schlüssel und speichert nich
 
 ## Preis in Euro oder Dollar
 
-`data-amount-fiat="25.00" data-currency="EUR"` statt `data-amount`. Beim Öffnen holt der Knopf den aktuellen Kurs (zuerst
-CoinGecko; Ersatz: öffentliche Blockchain-API für USD, für EUR zusätzlich der offizielle EZB-Referenzkurs). Der BSV-Betrag wird
+`data-amount-fiat="25.00" data-currency="EUR"` statt `data-amount`. Beim Öffnen holt der Knopf den aktuellen Kurs aus
+**zwei Quellen** (CoinGecko und eine öffentliche Blockchain-API, für EUR zusätzlich der offizielle EZB-Referenzkurs). Weichen
+die beiden um mehr als 3 % ab oder antwortet nur eine, gibt es **keinen QR-Code** („Kurs nicht verfügbar“). Der BSV-Betrag wird
 immer **aufgerundet**, der Shop bekommt also nie zu wenig. Im Fenster stehen Preis, Kurs, Uhrzeit und Kursquelle.
 **Ohne frischen Kurs (höchstens 10 Minuten alt) gibt es keinen QR-Code.**
 
@@ -47,12 +57,17 @@ Beträge stehen immer mit **Punkt** (z. B. `0.0005 BSV`), genau wie in der Walle
 ## Lieferadresse (optional)
 
 ```html
+<script src="https://pay.kallubi-bsv-explorer.de/v/1.3.0/button.min.js" integrity="sha384-RN5EDUvjdODos1TI96IMyGAIBGUJmvv9CqYa/D4reDQf18iICiRErukOjqPwb4R8" crossorigin="anonymous"
+        data-allowed-to="1DEINE_BSV_ADRESSE" data-shipping-email="bestellung@shop.example" defer></script>
 <div data-kallubi-pay data-to="1DEINE_BSV_ADRESSE" data-amount="0.0005" data-label="Hoodie" data-merchant="Merch Shop"
-     data-shipping="1" data-shipping-email="bestellung@shop.example"></div>
+     data-shipping="1"></div>
 ```
 
 - `data-shipping="1"`: vor dem QR-Code kommt ein Formular (Name, Straße, PLZ, Ort, Land, E-Mail und Nachricht freiwillig).
 - **Die Adresse geht nur an den Shop, nie an Kallubi.** Kallubi speichert nichts.
+- **Neu in 1.3.0:** `data-shipping-email` und `data-shipping-url` stehen im `<script>`-Tag (oder per JavaScript), nicht mehr am Knopf.
+  Die Adresse steckt nicht mehr in den Seiten-Ereignissen (die jedes Skript auf der Seite mitlesen kann), nur noch in
+  `KallubiPay.onPaid(…)` / `KallubiPay.on('shipping', …)`.
 - `data-shipping-email`: Nach der Zahlung öffnet ein Knopf das Mailprogramm des Käufers mit Adresse und Transaktion.
 - `data-shipping-url="https://…"`: Der Browser des Käufers schickt die Adresse direkt an diese Adresse des Shops. Bei einem
   fremden Formular-Dienst braucht der Shop einen AV-Vertrag (DSGVO).
@@ -61,8 +76,11 @@ Beträge stehen immer mit **Punkt** (z. B. `0.0005 BSV`), genau wie in der Walle
 
 1. Beim Öffnen hängt er ein paar zufällige sats an den Preis (z. B. 50.000 → **50.037 sats**). Das hilft, Zahlungen
    auseinanderzuhalten, ist aber keine Garantie.
-2. Alle 5 Sekunden fragt er nach, ob eine **neue** Zahlung mit mindestens diesem Betrag an die Adresse ging: zuerst bei der
-   Kallubi-Node, wenn nötig bei einer öffentlichen Blockchain-API. Der Betrag wird immer aus der echten Transaktion gelesen
+2. Alle 5 Sekunden fragt er nach, ob eine **neue** Zahlung mit **genau** diesem Betrag an die Adresse ging (neu in 1.3.0;
+   vorher „mindestens“). Kommt mehr an, erscheint der Hinweis, dass mehr als die Rechnung gezahlt wurde und
+   der Käufer sich mit der Transaktion beim Shop melden soll; das gilt nicht als bezahlt (`kallubi:overpaid`). Kann der
+   Knopf gerade gar nicht prüfen, steht dort „Zahlungen können gerade nicht geprüft werden. Neuer Versuch läuft…“ und es
+   wird nichts als bezahlt erkannt, bis die Prüfung wieder geht. Die Prüfung läuft zuerst bei der Kallubi-Node, wenn nötig bei einer öffentlichen Blockchain-API. Der Betrag wird immer aus der echten Transaktion gelesen
    (Prüfsumme = Transaktions-ID), nie aus einer fremden Zahl.
 3. **Bestätigungsregel:**
    - Eine **nicht endgültige** Transaktion (Zeitsperre) gilt nie sofort als bezahlt.

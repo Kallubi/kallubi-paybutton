@@ -14,4 +14,5 @@ namespace_id = "4711"
   limit = 30
   period = 60
 
+# Required before go-live: wrangler secret put RL_SALT   (>= 32 random characters, e.g. openssl rand -hex 32; never commit it)
 # Optional: wrangler secret put WOC_API_KEY   (higher WhatsOnChain quota)

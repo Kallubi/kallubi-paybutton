@@ -1,0 +1,7 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Kallubi Pay v1.3.0 – window.KallubiPayConfig fixture</title></head>
+<body>
+<div id="slot"></div>
+<script>window.__cb = []; window.KallubiPayConfig = { allowedTo: ['1111111111111111111114oLvT2'], onPaid: function (d, el) { window.__cb.push({ d: d, id: el && el.id }); } };</script>
+<script src="../dist/button.min.js" defer></script>
+<script>window.__ev=[];['kallubi:paid','kallubi:seen','kallubi:dropped','kallubi:overpaid','kallubi:shipping','kallubi:late','kallubi:expired'].forEach(function(n){document.addEventListener(n,function(e){window.__ev.push({type:n,d:e.detail,id:(e.target.closest&&e.target.closest('[id]')||{}).id})})});</script>
+</body></html>

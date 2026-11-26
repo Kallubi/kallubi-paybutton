@@ -1,13 +1,18 @@
-/* Kallubi Pay · payment-check proxy (Cloudflare Worker) · v1 · NOT DEPLOYED
-   GET /api/pay/check?to=<P2PKH address>&amount=<sats>&since=<unix seconds>
-   -> { ok:true, matches:[{ txid, sats, confirmations }] }   (txs paying >= amount to `to`, not older than `since`)
+/* Kallubi Pay · payment-check proxy (Cloudflare Worker) · v1.3.0 · NOT DEPLOYED
+   GET /api/pay/check?to=<P2PKH address>&amount=<sats>&since=<unix seconds>[&match=exact|min]
+   -> { ok:true, matches:[{ txid, sats, confirmations, exact }] }   (txs paying `to`, not older than `since`)
+   match=exact (default since v1.3.0): only txs paying EXACTLY `amount` are matches; txs paying more are listed with
+   overpaid:true (the button shows "contact the shop", never "paid"). match=min: the pre-1.3 rule (>= amount).
+   The answer is only a hint: the button re-checks every amount from the raw transaction (hash = txid).
 
    Why a proxy at all (the widget can also talk to WhatsOnChain directly):
    - one shared edge cache per address (4 s) and per tx (1 h): 100 open dialogs on one shop = ~1 upstream call / 4 s
    - optional WoC API key (secret WOC_API_KEY) for a higher, predictable quota; on WoC 429 we serve the last cached answer
    - the buyer's IP is never sent to WhatsOnChain
-   Privacy: no logging, no cookies, no storage of IPs. The rate-limit key is a SHA-256 of (IP + daily salt), computed in
-   memory only and handed to the Cloudflare rate-limit binding; nothing is written anywhere by this code.
+   Privacy: no logging, no cookies, no storage of IPs. The rate-limit key is a SHA-256 of (secret salt + day + IP), computed
+   in memory only and handed to the Cloudflare rate-limit binding; nothing is written anywhere by this code.
+   v1.3.0: the salt is secret (wrangler secret put RL_SALT, >= 32 random characters). Without it a random per-isolate salt
+   is used, so the key can never be recomputed from a known IP by anyone outside the running worker.
    Receive-only: only public addresses, no keys, no signing, no custody. */
 
 const WOC = 'https://api.whatsonchain.com/v1/bsv/main';
@@ -68,7 +73,7 @@ async function woc(path, ttl, env, ctx) {
   if (!r.ok) return { status: r.status };
   const text = await r.text();
   if (text.length > 3000000) return { status: 502 };
-  const body = JSON.parse(text);
+  let body; try { body = JSON.parse(text); } catch (e) { return { status: 502 }; }   // HTML / garbage instead of JSON = upstream error
   if (cache) {
     const put = cache.put(key, new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=' + (typeof ttl === 'function' ? ttl(body) : ttl) } }));
     if (ctx && ctx.waitUntil) ctx.waitUntil(put); else await put;
@@ -78,7 +83,7 @@ async function woc(path, ttl, env, ctx) {
 const listHashes = (b) => (Array.isArray(b) ? b : (b && Array.isArray(b.result) ? b.result : []))
   .map((x) => x && x.tx_hash).filter((h) => /^[0-9a-f]{64}$/.test(h || ''));
 
-export async function check(to, sats, since, env, ctx) {
+export async function check(to, sats, since, env, ctx, match = 'exact') {
   const script = await addressScript(to);
   if (!script) return err(400, 'bad_address');
   const [u, c] = await Promise.all([
@@ -98,17 +103,28 @@ export async function check(to, sats, since, env, ctx) {
     if (t.status === 429) break;                  // keep what we have, client polls again
     if (t.status !== 200 || !t.body || String(t.body.txid || t.body.hash || '').toLowerCase() !== h) continue;
     const bt = Number(t.body.blocktime || t.body.time || 0);
+    if (Number(t.body.confirmations) > 0 && !bt) continue;   // v1.3.0 fail-closed: confirmed but no block time = age unknown, never a match
     if (bt && bt < since - SINCE_SLACK_S) continue;
     const got = satsToScript(t.body, script);
-    if (got >= sats) matches.push({ txid: h, sats: got, confirmations: Number(t.body.confirmations) || 0 });
+    if (got < sats) continue;
+    const m = { txid: h, sats: got, confirmations: Number(t.body.confirmations) || 0, exact: got === sats };
+    if (match === 'exact' && got > sats) m.overpaid = true;     // listed so the button can say "contact the shop", never a match
+    matches.push(m);
   }
   return json(200, { ok: true, matches });
 }
 
-async function clientKey(request) {
+let isolateSalt = null;
+export function rateSalt(env) {
+  const s = env && typeof env.RL_SALT === 'string' ? env.RL_SALT : '';
+  if (s.length >= 32) return s;
+  if (!isolateSalt) { const b = new Uint8Array(32); crypto.getRandomValues(b); isolateSalt = hex(b); }   // random, never leaves memory
+  return isolateSalt;
+}
+export async function clientKey(request, env) {
   const ip = request.headers.get('CF-Connecting-IP') || '';
   const day = new Date().toISOString().slice(0, 10);
-  return hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('kallubi-pay|' + day + '|' + ip)));   // in memory only
+  return hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rateSalt(env) + '|' + day + '|' + ip)));   // in memory only
 }
 
 export default {
@@ -123,11 +139,13 @@ export default {
       const since = Number(url.searchParams.get('since') || 0);
       if (!Number.isInteger(sats) || sats < 1 || sats > MAX_SATS) return err(400, 'bad_amount');
       if (!Number.isInteger(since) || since < 0 || since > 4e9) return err(400, 'bad_since');
+      const match = url.searchParams.get('match') || 'exact';
+      if (match !== 'exact' && match !== 'min') return err(400, 'bad_match');
       if (env && env.PAY_RL && typeof env.PAY_RL.limit === 'function') {           // Cloudflare rate-limit binding
-        const { success } = await env.PAY_RL.limit({ key: await clientKey(request) });
+        const { success } = await env.PAY_RL.limit({ key: await clientKey(request, env) });
         if (!success) return err(429, 'rate_limited', { 'Retry-After': '30' });
       }
-      return await check(to, sats, since, env, ctx);
+      return await check(to, sats, since, env, ctx, match);
     } catch (e) { return err(500, 'internal'); }    // no details, nothing logged
   },
 };

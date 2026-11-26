@@ -151,6 +151,10 @@ await t('verify: unknown tx -> not_found; WoC 429 -> source_error; status lookup
   woc429 = true; const id = put([[50037, SCRIPT]]); assert.equal((await verify({ txid: id, exactSats: 50037 })).status, 'source_error'); woc429 = false;
   statusDown = true; const r = await verify({ txid: id, exactSats: 50037 }); assert.equal(r.status, 'source_error'); assert.equal(r.reason, 'status_unavailable'); statusDown = false;
 });
+await t('verify v1.3.0: confirmed tx without block time (age unknown) -> fail closed (source_error blocktime_unavailable), never paid', async () => {
+  const id = put([[50037, SCRIPT]], { confirmations: 2, blocktime: 0 });
+  const r = await verify({ txid: id, exactSats: 50037 }); assert.equal(r.status, 'source_error'); assert.equal(r.reason, 'blocktime_unavailable'); assert.ok(!r.ok);
+});
 await t('verify: bad input is refused before any network call (txid, address, amount, orderId, no claims store, minConfirmations)', async () => {
   const id = put([[50037, SCRIPT]]);
   const cases = [{ txid: 'xyz', exactSats: 1 }, { txid: id, exactSats: 1, address: '3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy' }, { txid: id, exactSats: 0 }, { txid: id, exactSats: 1.5 }, { txid: id },
@@ -183,11 +187,27 @@ await t('quote: server-made exact amount with a random tag unique among open ord
 await t('rate: CoinGecko fresh -> used; stale -> refused for EUR; USD falls back to WhatsOnChain; nothing fresh -> throws', async () => {
   const mk = (cg, woc) => async (url) => ({ ok: true, status: 200, text: async () => JSON.stringify(url.includes('coingecko') ? cg : woc) });
   const n = 1800000000;
-  assert.deepEqual(await V.fetchRate('EUR', { now: n, fetchImpl: mk({ 'bitcoin-cash-sv': { eur: 12.67, usd: 13.9, last_updated_at: n - 30 } }) }), { rate: 12.67, rateTime: n - 30, source: 'coingecko' });
+  // pre-1.3 single-source behaviour is now the explicit opt-in minSources: 1
+  assert.deepEqual(await V.fetchRate('EUR', { now: n, minSources: 1, fetchImpl: mk({ 'bitcoin-cash-sv': { eur: 12.67, usd: 13.9, last_updated_at: n - 30 } }) }), { rate: 12.67, rateTime: n - 30, source: 'coingecko', sources: 1 });
   await assert.rejects(V.fetchRate('EUR', { now: n, fetchImpl: mk({ 'bitcoin-cash-sv': { eur: 12.67, last_updated_at: n - 601 } }, { rate: 14, time: n, currency: 'USD' }) }));
-  assert.equal((await V.fetchRate('USD', { now: n, fetchImpl: mk({ 'bitcoin-cash-sv': { usd: 0, last_updated_at: n } }, { rate: 14.25, time: n - 5, currency: 'USD' }) })).source, 'whatsonchain');
+  assert.equal((await V.fetchRate('USD', { now: n, minSources: 1, fetchImpl: mk({ 'bitcoin-cash-sv': { usd: 0, last_updated_at: n } }, { rate: 14.25, time: n - 5, currency: 'USD' }) })).source, 'whatsonchain');
+  await assert.rejects(V.fetchRate('USD', { now: n, fetchImpl: mk({ 'bitcoin-cash-sv': { usd: 0, last_updated_at: n } }, { rate: 14.25, time: n - 5, currency: 'USD' }) }), /single_rate_source/);
   await assert.rejects(V.fetchRate('USD', { now: n, fetchImpl: mk({}, { rate: 14.25, time: n - 900, currency: 'USD' }) }));
   await assert.rejects(V.fetchRate('GBP', { now: n, fetchImpl: mk({}, {}) }));
+});
+// ---- v1.3.0 rate-check: two sources must agree
+await t('v1.3.0 rate: CoinGecko + WhatsOnChain agree (<= 3 %) -> CoinGecko rate, checkedBy; 5 % apart -> rate_mismatch; bounds 0.5..100000', async () => {
+  const n = 1800000000;
+  const mk = (cgUsd, wocUsd) => async (url) => ({ ok: true, status: 200, text: async () => JSON.stringify(url.includes('coingecko')
+    ? { 'bitcoin-cash-sv': { usd: cgUsd, eur: cgUsd, last_updated_at: n - 20 } } : { rate: wocUsd, time: n - 5, currency: 'USD' }) });
+  const r = await V.fetchRate('USD', { now: n, fetchImpl: mk(14.0, 14.3) });
+  assert.equal(r.rate, 14); assert.equal(r.source, 'coingecko'); assert.equal(r.checkedBy, 'whatsonchain'); assert.equal(r.sources, 2);
+  await assert.rejects(V.fetchRate('USD', { now: n, fetchImpl: mk(14.0, 14.7) }), /rate_mismatch/);      // 5 % apart
+  await assert.rejects(V.fetchRate('USD', { now: n, minSources: 1, fetchImpl: mk(14.0, 14.7) }), /rate_mismatch/);   // disagreement is never ignored
+  await assert.rejects(V.fetchRate('USD', { now: n, fetchImpl: mk(1.4, 14.0) }), /rate_mismatch/);       // one source 10x off (manipulated / bad data)
+  assert.equal(V.ratesAgree(100, 103), true); assert.equal(V.ratesAgree(100, 103.01), false);
+  assert.equal(V.rateMicro(0.49), null); assert.equal(V.rateMicro(100001), null); assert.equal(V.rateMicro(100000), 100000000000);
+  await assert.rejects(V.fetchRate('USD', { now: n, minSources: 3, fetchImpl: mk(14, 14) }), RangeError);
 });
 await t('fiat: minSatsFromFiat = price at the server rate minus tolerance (2 % default), refuses silly tolerances', () => {
   assert.equal(V.minSatsFromFiat(2500, 12.67), Math.floor(197316496 * 0.98)); assert.equal(V.minSatsFromFiat(2500, 12.67, 0), 197316496);
@@ -211,9 +231,11 @@ await t('rate: CoinGecko down -> EUR = WhatsOnChain USD / ECB, source shown; cac
   const mk = (cg, woc, xml) => async (url) => { if (url.includes('ecb.europa.eu')) { ecbCalls++; return { ok: true, status: 200, text: async () => xml }; }
     return { ok: true, status: 200, text: async () => JSON.stringify(url.includes('coingecko') ? cg : woc) }; };
   V.clearEcbCache();
-  const r = await V.fetchRate('EUR', { now: n, fetchImpl: mk({}, { rate: 21.926, time: n - 10, currency: 'USD' }, ecbXml(day(n), '1.0963')) });
+  await assert.rejects(V.fetchRate('EUR', { now: n, fetchImpl: mk({}, { rate: 21.926, time: n - 10, currency: 'USD' }, ecbXml(day(n), '1.0963')) }), /single_rate_source/);
+  V.clearEcbCache(); ecbCalls = 0;
+  const r = await V.fetchRate('EUR', { now: n, minSources: 1, fetchImpl: mk({}, { rate: 21.926, time: n - 10, currency: 'USD' }, ecbXml(day(n), '1.0963')) });
   assert.equal(r.source, 'whatsonchain+ecb'); assert.equal(r.rate, 20); assert.equal(r.ecbRate, 1.0963); assert.equal(r.usdRate, 21.926); assert.equal(r.ecbDate, day(n)); assert.equal(r.rateTime, n - 10);
-  await V.fetchRate('EUR', { now: n + 60, fetchImpl: mk({}, { rate: 21.926, time: n + 50, currency: 'USD' }, 'not used') }); assert.equal(ecbCalls, 1);
+  await V.fetchRate('EUR', { now: n + 60, minSources: 1, fetchImpl: mk({}, { rate: 21.926, time: n + 50, currency: 'USD' }, 'not used') }); assert.equal(ecbCalls, 1);
   V.clearEcbCache();
   await assert.rejects(V.fetchRate('EUR', { now: n, fetchImpl: mk({}, { rate: 21.926, time: n, currency: 'USD' }, ecbXml(day(n, 6), '1.0963')) }));
   await assert.rejects(V.fetchRate('EUR', { now: n, fetchImpl: mk({}, { rate: 21.926, time: n - 900, currency: 'USD' }, ecbXml(day(n), '1.0963')) }));
@@ -312,6 +334,40 @@ await t("verifyPayment quickCheck:'run': 25 EUR paid at 0-conf after a passed se
   const e = mk([[190004, SCRIPT]]);
   r = await verify({ txid: e, exactSats: 190004, orderCents: 25000, quickCheck: 'run', broadcasters: BCS, quickWatchMs: 3000 });
   assert.equal(r.status, 'pending'); assert.equal(r.quickCheck, undefined);   // above 200 EUR: always 1 confirmation, no check
+});
+// ---- v1.3.0: exact-amount (exact by default), verify-limits (size before hashing, streaming cap, https-only RPC)
+await t('v1.3.0 exact-amount: two buyers pay the same address - exactSats binds each payment to its own order only', async () => {
+  const a = put([[50037, SCRIPT]]), b = put([[50052, SCRIPT]]);
+  assert.equal((await verify({ txid: a, exactSats: 50037, orderId: 'A' })).status, 'paid');
+  assert.equal((await verify({ txid: b, exactSats: 50037, orderId: 'A' })).status, 'overpaid');     // buyer B's tx is not A's payment
+  assert.equal((await verify({ txid: b, exactSats: 50052, orderId: 'B' })).status, 'paid');
+});
+await t('v1.3.0 verify-limits: a raw tx above 1 MB is refused as too_large before any hashing; parseRawTx has the same cap', async () => {
+  const big = rawTx([[50037, SCRIPT]], { extra: '00'.repeat(1024 * 1024 + 10) }); const id = 'ef'.repeat(32);
+  TX.set(id, { hex: big, confirmations: 0, blocktime: 0 });
+  const t0 = Date.now(); const r = await verify({ txid: id, exactSats: 50037 });
+  assert.equal(r.status, 'bad_tx'); assert.equal(r.reason, 'too_large'); assert.ok(Date.now() - t0 < 3000);
+  assert.throws(() => V.parseRawTx(big), /bad_hex/); assert.equal(V.MAX_TX_BYTES, 1024 * 1024);
+});
+await t('v1.3.0 verify-limits: readCapped stops an endless body early (stream cancelled), refuses a big Content-Length up front', async () => {
+  let pulls = 0, cancelled = false;
+  const body = new ReadableStream({ pull(c) { pulls++; c.enqueue(new Uint8Array(64 * 1024)); }, cancel() { cancelled = true; } });
+  await assert.rejects(V.readCapped(new Response(body), 1024 * 1024), /too_large/);
+  assert.ok(cancelled && pulls < 40, 'pulls=' + pulls);
+  await assert.rejects(V.readCapped(new Response('x', { headers: { 'content-length': String(5e7) } }), 1024), /too_large/);
+  assert.equal(await V.readCapped(new Response('hello'), 10), 'hello');
+  // a source answering a huge hex body is refused, not read into memory
+  const f = async (url) => new Response(new ReadableStream({ pull(c) { c.enqueue(new TextEncoder().encode('00'.repeat(32768))); } }), { status: 200 });
+  const r = await V.verifyPayment({ txid: 'ab'.repeat(32), address: ADDR, exactSats: 1, orderId: 'X', claims: new V.MemoryClaims(), fetchImpl: f });
+  assert.equal(r.status, 'bad_tx'); assert.equal(r.reason, 'too_large');
+});
+await t('v1.3.0 verify-limits: RPC source must be https:// (http only for localhost / 127.0.0.1 / [::1]); custom WoC base likewise', async () => {
+  const id = put([[50037, SCRIPT]]);
+  for (const url of ['http://node.example.com:8332/', 'ftp://x/', 'http://192.0.2.5:8332', 'http://localhost.evil.com/']) {
+    assert.equal((await verify({ txid: id, exactSats: 50037, source: { rpc: { url, user: 'u', password: 'p' } } })).status, 'bad_input', url);
+  }
+  assert.equal((await verify({ txid: id, exactSats: 50037, source: { woc: 'http://api.example.com/v1/bsv/main' } })).status, 'bad_input');
+  assert.equal(V.sourceUrlOk('https://node.example.com/rpc'), true); assert.equal(V.sourceUrlOk('http://[::1]:8332/'), true); assert.equal(V.sourceUrlOk('http://127.0.0.1:8332'), true);
 });
 srv.close();
 const passed = results.filter((x) => x[0] === 'PASS').length, failed = results.length - passed;

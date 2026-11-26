@@ -81,6 +81,9 @@ class MockChain:
         self.node_conf = None   # override the node's confirmations (e.g. -1 = orphaned block)
         self.big = False        # node announces a huge hex body
         self.node_txindex = True  # False: node answers 404 for confirmed txs (like a node without -txindex)
+        self.status_mode = None   # v1.3.0 status fail-closed: None | '429' | '503' | 'html' (status endpoints /tx/<id>, /tx/hash/<id> fail)
+        self.blocktime = None     # override block time of a confirmed tx (e.g. an old tx mined before the invoice)
+        self.woc_usd = 22.0       # v1.3.0 second rate source; 22 USD / 1.1 USD per EUR = 20 EUR, agrees with the CoinGecko stub
     @property
     def pay_sats(self): return self._sats
     @pay_sats.setter
@@ -97,13 +100,22 @@ class MockChain:
         route.fulfill(status=404, body=body, headers={'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'})
     def handle(self, route):
         u = route.request.url
+        # v1.3.0: the second rate source (WhatsOnChain USD, cross-checked against CoinGecko). Answered independently of the
+        # chain-fallback state (self.fb), so 'fallback down' tests keep testing chain detection only.
+        if u == FALLBACK + '/exchangerate':
+            return self._json(route, {'currency': 'USD', 'rate': self.woc_usd, 'time': int(time.time()) - 5})
         if u.startswith(NODE): return self.handle_node(route, u[len(NODE):])
         if u.startswith(FALLBACK): return self.handle_fb(route, u[len(FALLBACK):])
         return self._404(route)
     def known(self): return self.phase != 'empty' and self.txid is not None
+    def _status_fail(self, route):
+        if self.status_mode == 'html': return route.fulfill(status=200, body='<html><body>429 Too Many Requests</body></html>', headers={'Content-Type': 'text/html', 'Access-Control-Allow-Origin': '*'})
+        return route.fulfill(status=int(self.status_mode), body='<html>busy</html>', headers={'Content-Type': 'text/html', 'Access-Control-Allow-Origin': '*'})
+    def _bt(self): return self.blocktime if self.blocktime is not None else int(time.time())
     def handle_node(self, route, p):
         self.calls.append(p); self.node_calls.append(p)
         if self.node == 'down': return route.abort('connectionrefused')
+        if self.status_mode and self.known() and p == '/tx/' + self.txid: return self._status_fail(route)
         if p.startswith('/address/'):
             if self.node != 'index': return self._404(route, '{"error":"not available"}')
             unc = [{'tx_hash': self.txid, 'height': 0, 'received': self._sats, 'spent': 0}] if self.known() and self.phase == 'mempool' else []
@@ -118,7 +130,7 @@ class MockChain:
         if self.known() and p == '/tx/' + self.txid:
             n = self.conf() if self.node_conf is None else self.node_conf; body = {'txid': self.txid, 'confirmations': n, 'vout': []}
             if n < 0: body['orphaned'] = True
-            if n: body.update({'blockhash': '00' * 32, 'blocktime': int(time.time()), 'time': int(time.time()), 'blockheight': 900000})
+            if n: body.update({'blockhash': '00' * 32, 'blocktime': self._bt(), 'time': self._bt(), 'blockheight': 900000})
             return self._json(route, body)
         for pt, ph in PARENTS.items():
             if p == '/tx/' + pt + '/hex': return self._text(route, ph)
@@ -133,9 +145,10 @@ class MockChain:
             if self.tamper == 'both': return self._text(route, build_tx([(self._sats * 10, self.script)])[1])
             return self._text(route, self.hex)
         if self.known() and p == '/tx/hash/' + self.txid:
-            n = self.conf(); body = {'txid': self.txid, 'hash': self.txid, 'time': int(time.time()), 'confirmations': n,
+            if self.status_mode: return self._status_fail(route)
+            n = self.conf(); body = {'txid': self.txid, 'hash': self.txid, 'time': self._bt() if n else int(time.time()), 'confirmations': n,
                                      'vout': [{'value': (self._sats * (100 if self.tamper == 'json' else 1)) / 1e8, 'n': 0, 'scriptPubKey': {'hex': self.script}}]}
-            if n: body['blocktime'] = int(time.time())
+            if n: body['blocktime'] = self._bt()
             return self._json(route, body)
         for pt, ph in PARENTS.items():
             if p == '/tx/' + pt + '/hex': return self._text(route, ph)

@@ -1,4 +1,4 @@
-# Kallubi Pay Button · v1.2.0
+# Kallubi Pay Button · v1.3.0
 
 A drop-in **"Pay with BSV"** button for any website. One `<script>` tag, one `<div>`.
 The buyer pays **straight to the merchant's own BSV address**. Kallubi never holds funds:
@@ -17,7 +17,10 @@ legal or tax advice. German guide: [ANLEITUNG-DE.md](ANLEITUNG-DE.md).
 ## Embed
 
 ```html
-<script src="https://pay.kallubi-bsv-explorer.de/button.js" defer></script>
+<script src="https://pay.kallubi-bsv-explorer.de/v/1.3.0/button.min.js"
+        integrity="sha384-RN5EDUvjdODos1TI96IMyGAIBGUJmvv9CqYa/D4reDQf18iICiRErukOjqPwb4R8"
+        crossorigin="anonymous"
+        data-allowed-to="1YourOwnBsvAddress..." defer></script>
 
 <div data-kallubi-pay
      data-to="1YourOwnBsvAddress..."
@@ -25,6 +28,18 @@ legal or tax advice. German guide: [ANLEITUNG-DE.md](ANLEITUNG-DE.md).
      data-label="Basic T-Shirt"
      data-theme="auto"></div>
 ```
+
+**Recommended since v1.3.0:**
+
+- Load the **versioned file** `/v/1.3.0/button.min.js` with the `integrity` hash above (Subresource Integrity). That file
+  never changes; if a single byte differed, the browser would refuse to run it. A new version gets a new path and a new
+  hash (see `dist/SRI.json` and the release notes). `crossorigin="anonymous"` is required for the integrity check.
+- `data-allowed-to` on the **script tag** lists the address(es) your buttons may pay to (comma separated). A button whose
+  `data-to` is not on the list shows an error instead of a QR code. This protects you if someone can put HTML on your
+  page (comments, reviews, profile texts, a compromised plugin): an injected `<div data-kallubi-pay data-to="1Attacker…">`
+  can then not ask your buyers to pay someone else.
+- The old path `/button.js` keeps working and always serves the **latest** version (short cache, no integrity hash
+  possible). Use it only if you want automatic updates.
 
 The button is also presented, with a live demo and an embed-code generator, in the **Pay Button** tab of the
 Kallubi Explorer (`https://kallubi-bsv-explorer.de/?tool=paybutton`). `pay.kallubi-bsv-explorer.de` only serves the script file.
@@ -50,15 +65,62 @@ Kallubi Explorer (`https://kallubi-bsv-explorer.de/?tool=paybutton`). `pay.kallu
 | `data-ttl` | – | older form: payment window in seconds (default 900 = 15 min) |
 | `data-confirm-above` | – | Optional BSV override: amount in BSV from which a payment needs **1 block confirmation**. `0` = always wait. Cannot be combined with `data-confirm-above-fiat`. If omitted, the EUR line below applies (converted with the rate). |
 | `data-confirm-above-fiat` | – | EUR amount (not the button currency). Prices **above** this line need **1 block confirmation**. Default **`200`**. `0` = always wait. USD is converted from this EUR amount with the ECB rate; BSV prices convert it with the EUR/BSV rate. Without a valid rate the button waits. |
-| `data-api` | – | URL of the optional check worker (`https://…/api/pay/check`). Empty = direct detection (own node first, see below). The worker's answer is only a hint: amount and confirmations are re-checked from the raw tx via `data-node` / the fallback (with both turned off, a worker answer is never accepted) |
-| `data-node` | – | advanced: base URL of the Kallubi node API (default `https://node.kallubi-bsv-explorer.de/v1/bsv/main`; `""` = do not use it) |
-| `data-fallback` | – | `0` = never use the public fallback source (detection then depends on the own node only). Default on |
-| `data-on-paid` | – | name of a global function, e.g. `myShop.onPaid` (looked up by name, never `eval`ed) |
+| `data-node` | – | only `""` (empty) is honoured on the button: do not use the Kallubi node. **v1.3.0:** a custom node URL is set via JS (`KallubiPay.config({ node })`), not in the markup |
+| `data-fallback` | – | `0` = never use the public fallback source (detection then depends on the own node only). Default on. With `data-amount-fiat` this also leaves only one rate source, so there is **no price quote** unless you allow one source via JS (`rateSources: 1`) |
 | `data-test` | – | `1` = **test mode**: no chain requests, simulated payment (with `data-amount-fiat` the real rate is still loaded) after ~8 s (`data-test-delay` ms); a simulated confirmation follows after `data-test-confirm-delay` ms (default 8000) when the amount is at/above `data-confirm-above` |
 | `data-shipping` | – | `1` = ask the buyer for a **shipping address** before the QR step (default off). The address goes **only to the merchant**, never to Kallubi. See "Shipping address" below |
-| `data-shipping-url` | – | only with `data-shipping="1"`: **your own HTTPS endpoint**. The buyer's browser POSTs the address + txid there as JSON once the payment is seen. Must allow CORS. `http://` is only accepted for `localhost` (dev) |
-| `data-shipping-email` | – | only with `data-shipping="1"`: your shop email. After payment the buyer gets an "Email address to the shop ✉" button (opens *their* mail app with address + txid filled in). Also used as a fallback if the URL fails |
 | `data-poll-ms` | – | advanced: poll interval in ms (default 5000, min 1000). Leave it alone in production |
+
+**Moved in v1.3.0 (ignored on the button, with a console warning):** `data-on-paid`, `data-api`, `data-node="<url>"`,
+`data-fallback-url`, `data-broadcaster-url`, `data-quick-ms`, `data-shipping-url`, `data-shipping-email`. Anything on the
+button can be written by whoever can put HTML on the page, so where money is checked or buyer data is sent is now
+decided only by the script tag or by JavaScript (see the next two tables).
+
+### Script-tag attributes (v1.3.0, trusted)
+
+Read once from the `<script>` tag that loads the button. They apply to every button on the page.
+
+| attribute | values / meaning |
+|---|---|
+| `data-allowed-to` | comma-separated list of your mainnet P2PKH addresses. Buttons paying anywhere else show a config error ("this address is not in the shop's allowed list") instead of a QR code. Strongly recommended. Can only be narrowed later by JS, never widened |
+| `data-mount` | CSS selector, e.g. `#shop`. Auto-mount then only picks up buttons **inside** that container (opt-in; default: the whole page). Use it when user content lives outside your shop area |
+| `data-auto-mount` | `0` = do not mount anything automatically; you call `KallubiPay.mount(el)` yourself |
+| `data-shipping-url` | with `data-shipping="1"` on a button: **your own HTTPS endpoint**. The buyer's browser POSTs the address + txid there as JSON once the payment is seen. Must allow CORS. `http://` only for `localhost` (dev) |
+| `data-shipping-email` | with `data-shipping="1"`: your shop email. After payment the buyer gets an "Email address to the shop ✉" button (opens *their* mail app with address + txid filled in). Also the fallback if the URL fails |
+| `data-api` | URL of the optional check worker (`https://…/api/pay/check`). The worker's answer is only a hint: amount and confirmations are re-checked from the raw tx (with node and fallback both off, a worker answer is never accepted) |
+| `data-rate-sources` | `2` (default) = a fiat price needs two rate sources that agree within 3 %; `1` = one source is enough (weaker) |
+
+### JavaScript API (v1.3.0)
+
+```js
+// optional, BEFORE the script tag (a plain object; anything else is ignored):
+window.KallubiPayConfig = { allowedTo: ['1Your…'], onPaid: (d) => { /* UX only */ } };
+
+// any time after the script loaded:
+KallubiPay.config({ shippingUrl: 'https://shop.example/api/orders' });   // returns a copy of the settings
+const off = KallubiPay.onPaid((detail, el) => { /* … */ });             // off() unsubscribes
+KallubiPay.on('overpaid', (detail, el) => { /* … */ });                  // paid seen late expired dropped overpaid shipping shipping-sent
+KallubiPay.mount(el, { acceptOverpay: false });                          // per-button options, same keys as config()
+KallubiPay.scan();                                                       // mount new buttons (inside data-mount, if set)
+KallubiPay.version;                                                      // "1.3.0"
+```
+
+| key (config / mount / KallubiPayConfig) | meaning |
+|---|---|
+| `allowedTo` | array or comma list of allowed addresses (see `data-allowed-to`) |
+| `onPaid`, `onSeen`, `onLate`, `onDropped`, `onExpired`, `onOverpaid`, `onShipping` | callback functions (replace `data-on-paid`) |
+| `node` | base URL of the Kallubi node API (default `https://node.kallubi-bsv-explorer.de/v1/bsv/main`; `''` = off) |
+| `fallback` / `fallbackUrl` | `false` = no public fallback / other https fallback base URL |
+| `broadcasterUrl`, `quickMs` | advanced: quick-check endpoint and window (3000–15000 ms) |
+| `api` | check worker URL (see `data-api`) |
+| `shippingUrl`, `shippingEmail` | see the script-tag table |
+| `acceptOverpay` | `true` = a payment **above** the exact amount also counts as paid (old behaviour). Default `false` |
+| `rateSources` | `2` (default) or `1`, see `data-rate-sources` |
+| `shippingInEvents` | `true` = put the full shipping address into the bubbling page events again (old behaviour). Default `false` |
+| `closedShadow` | `true` = the widget uses a closed shadow root (see "Security & privacy"). Default `false` |
+| `mount`, `autoMount` | see `data-mount`, `data-auto-mount` (global only) |
+
+Markup is never trusted for these keys, and `KallubiPay` itself cannot be replaced or changed after it loaded.
 
 ### Languages (`data-lang`)
 
@@ -95,7 +157,7 @@ document.addEventListener('kallubi:seen', (e) => {
 
 The event bubbles from your `<div>` (also through shadow roots).
 
-> **Important: browser events are UX only.** `kallubi:paid` and `data-on-paid` run in the buyer's browser.
+> **Important: browser events are UX only.** `kallubi:paid` and `KallubiPay.onPaid` run in the buyer's browser.
 > Anyone can fire them with made-up data from the developer console. **Never ship goods because of a browser event.**
 > Send `{ orderId, txid }` to your server and decide there, from the blockchain. See "Verify payments on your server" below.
 
@@ -109,6 +171,7 @@ New events in v1.2.0:
 | event | when |
 |---|---|
 | `kallubi:expired` | the payment window ended without a payment. The QR is withdrawn |
+| `kallubi:overpaid` | **v1.3.0** a payment to your address **above** the exact amount was seen. It is **not** reported as `kallubi:paid`; the buyer sees "A payment of … BSV (more than this invoice) reached this address. If it was yours, please contact the shop with transaction …" Decide on your server (`overpaid` status). `acceptOverpay: true` restores the old "at least" rule |
 | `kallubi:late` | a matching payment was found **after** the window ended (`late: true`, `expiredAt`). It is **not** reported as `kallubi:paid`. The buyer is told not to pay again and to contact you. Decide on your server (refund, accept, or ask for the difference) |
 
 ## Fiat prices (`data-amount-fiat`, v1.2.0)
@@ -118,8 +181,11 @@ New events in v1.2.0:
      data-order-id="ORDER-1042" data-expires-min="15"></div>
 ```
 
-- When the buyer opens the dialog, the button loads the current rate: **CoinGecko (EUR and USD) first**. Backup if
-  CoinGecko fails: **USD = WhatsOnChain; EUR = WhatsOnChain USD rate ÷ official ECB EUR/USD reference rate.**
+- When the buyer opens the dialog, the button loads the current rate from **two sources at the same time**: CoinGecko
+  (EUR and USD) and, as cross-check, **USD = WhatsOnChain; EUR = WhatsOnChain USD rate ÷ official ECB EUR/USD reference rate.**
+  **v1.3.0:** the two must agree within **3 %**, otherwise there is no QR code ("Exchange rate unavailable"). If only one
+  source answers, there is no QR code either, unless the shop allowed one source (`rateSources: 1`). The CoinGecko
+  rate is used for the amount; rates outside 0.5 – 100,000 per BSV are rejected.
 - The dialog always says where the rate came from ("Rate source: CoinGecko", or
   "Rate source: WhatsOnChain (USD) × ECB EUR/USD 1.0963 (2026-11-24)"). Events carry the same facts in `fiat.rateSource`
   (`coingecko`, `whatsonchain`, `whatsonchain+ecb`) and, for the backup, `fiat.usdRate`, `fiat.ecbRate`, `fiat.ecbDate`.
@@ -136,9 +202,9 @@ New events in v1.2.0:
 - Why the ECB Data Portal in the browser: the ECB daily XML file cannot be read by a browser on another website (the ECB
   server does not allow it). The official ECB Data Portal (`data-api.ecb.europa.eu`) publishes the **same** reference rate
   and allows it. The server helper (`kallubi-verify.mjs`) reads the daily XML directly.
-- `data-fallback="0"` also switches the rate backup off (CoinGecko only).
-- Privacy: in fiat mode the buyer's browser also contacts `api.coingecko.com`, and only if that fails
-  `api.whatsonchain.com` and `data-api.ecb.europa.eu` (no cookies, no referrer).
+- `data-fallback="0"` also switches the rate cross-check off; with the default `rateSources: 2` that means no fiat quote.
+- Privacy: in fiat mode the buyer's browser also contacts `api.coingecko.com`, `api.whatsonchain.com` and, for EUR,
+  `data-api.ecb.europa.eu` (no cookies, no referrer).
 - Confirmations for fiat prices: see "0-conf or 1 confirmation" below (default: up to 20.00 at 0-conf).
 
 ## Payment window and late payments (v1.2.0)
@@ -198,7 +264,13 @@ const res = await verifyPayment({ txid, orderId, address: '1Your…', minSats: m
 ```
 
 Level 1 is weaker: if two orders have the same price, someone could try to claim another buyer's payment first.
-Use Level 2 for anything that matters.
+Use Level 2 (`exactSats`) for anything that matters; **`exactSats` is the standard since v1.3.0**, `minSats` is only for
+setups where the server cannot know the exact amount.
+
+`fetchRate()` on the server also asks two sources and fails (`rate_mismatch`, `single_rate_source`) if they differ by
+more than 3 % or only one answers (`fetchRate('EUR', { minSources: 1 })` allows one). RPC and API base URLs must be
+`https://` (plain `http://` only for `localhost` / `127.0.0.1` / `[::1]`), raw transactions above 1 MB are rejected
+before hashing, and every response body is read with a size cap.
 
 ### Results
 
@@ -281,10 +353,13 @@ confirmed when it is first found, `kallubi:paid` fires right away with `confirme
 For shops without a shop system (e.g. a small merch seller on X) the widget can ask for a delivery address:
 
 ```html
+<script src="https://pay.kallubi-bsv-explorer.de/v/1.3.0/button.min.js" integrity="sha384-RN5EDUvjdODos1TI96IMyGAIBGUJmvv9CqYa/D4reDQf18iICiRErukOjqPwb4R8" crossorigin="anonymous"
+        data-allowed-to="1…"
+        data-shipping-url="https://merch-shop.example/api/orders"
+        data-shipping-email="orders@merch-shop.example" defer></script>
+
 <div data-kallubi-pay data-to="1…" data-amount="0.0005" data-label="Hoodie" data-merchant="Merch Shop"
-     data-shipping="1"
-     data-shipping-url="https://merch-shop.example/api/orders"
-     data-shipping-email="orders@merch-shop.example"></div>
+     data-shipping="1"></div>
 ```
 
 Flow: button → **form** (name, street + number, postal code, city, country, optional email, optional note; required fields
@@ -295,19 +370,22 @@ polling only start after the form is sent. Off by default: without `data-shippin
 
 - The address lives only in the widget's memory for this page session. No cookies, no localStorage, no Kallubi server.
 - It reaches the merchant in up to three ways, all of them chosen by the merchant:
-  1. **Page events** (for shops with their own JS): `kallubi:shipping` when the form is sent, and `shipping` inside
-     the `kallubi:seen` / `kallubi:paid` detail.
-  2. **`data-shipping-url`**: the buyer's browser POSTs JSON **directly** to that URL when the payment is first seen.
+  1. **JS callbacks** (for shops with their own JS): `KallubiPay.on('shipping', fn)` when the form is sent, and
+     `shipping` inside the detail passed to `KallubiPay.onPaid(fn)` / `on('seen', fn)`. **v1.3.0:** the bubbling page
+     events (`kallubi:shipping`, `kallubi:paid` …) no longer carry the address, only `shippingProvided: true`, because
+     every script on the page (tag managers, analytics, chat widgets) can listen to them. `shippingInEvents: true`
+     restores the old behaviour.
+  2. **`data-shipping-url`** (script tag): the buyer's browser POSTs JSON **directly** to that URL when the payment is first seen.
      Sent with `credentials:'omit'`, `referrerPolicy:'no-referrer'`, `redirect:'error'` (the data cannot be bounced to another host), 15 s timeout.
      Result: `kallubi:shipping-sent` `{ok, status, txid, order, test}`.
-  3. **`data-shipping-email`**: a `mailto:` button. The widget sends nothing; the buyer's own mail app opens and the buyer presses send.
+  3. **`data-shipping-email`** (script tag): a `mailto:` button. The widget sends nothing; the buyer's own mail app opens and the buyer presses send.
 - The form shows "🔒 Your address goes only to <merchant>, never to Kallubi." plus the receiving host when a URL is set.
 - Kallubi's explorer generator preview never sets a URL, so nothing is posted from Kallubi's page.
 
 POST body:
 
 ```json
-{ "kallubi": "shipping", "version": "1.0.0", "txid": "…64 hex…", "amount": "0.00050037", "sats": 50037,
+{ "kallubi": "shipping", "version": "1.3.0", "txid": "…64 hex…", "amount": "0.00050037", "sats": 50037,
   "requestedSats": 50037, "tag": 37, "to": "1…", "order": "MS-7", "label": "Hoodie", "merchant": "Merch Shop",
   "test": false, "confirmed": false, "confirmations": 0,
   "shipping": { "name": "…", "street": "…", "postalCode": "…", "city": "…", "country": "…", "email": "…", "note": "…" } }
@@ -327,21 +405,27 @@ If your page has a CSP, add your endpoint to `connect-src`.
 | **both** (URL + email) | automatic, and the mail button appears if the URL fails | as above |
 | **events only** | full control | needs own JS / backend |
 
-If `data-shipping="1"` is set without URL and email, the address is only available as a page event.
+If `data-shipping="1"` is set without URL and email, the address is only available to JS callbacks.
 
 ## How payment detection works
 
 1. When the dialog opens an **invoice** is created: amount + random **1–99 sats tag** (e.g. 50,000 → 50,037 sats),
    a `since` timestamp and a 15 min deadline. The exact amount is shown and is inside the QR / wallet link.
 2. The widget takes a **baseline** of all transactions already known for the address (mempool + last 20 confirmed).
+   **v1.3.0:** without a baseline nothing is matched. If no source answers, the dialog says "Cannot check for payments
+   right now. Retrying…" and keeps trying. If the baseline only arrives later (> 8 s), transactions that were already in
+   the mempool by then are not counted.
 3. Every ~5 s it reads the address' **unconfirmed** history (and every 4th poll the confirmed one).
    Each *new* tx (not in the baseline) is fetched and its outputs to the address's P2PKH script are summed
-   (same logic as Ask Kallubi's `satsToPayAddress()`). Match = sum **≥ invoice amount**, and not older than `since`.
+   (same logic as Ask Kallubi's `satsToPayAddress()`). **v1.3.0:** Match = sum **exactly equal** to the invoice amount
+   (an exact match is required unless the shop sets `acceptOverpay: true`), and not older than `since`. More than the
+   amount → `kallubi:overpaid` and a note for the buyer, never `kallubi:paid`. Transactions that pay less are skipped
+   before hashing; raw transactions above 1 MB are ignored; hashing uses the browser's `crypto.subtle`.
 4. Errors / HTTP 429 → exponential backoff up to 30 s; background tabs poll every 15 s.
 5. Closing the dialog does **not** stop watching until the window expires, so "paid, then closed" is still detected.
    Re-opening within the window shows the same invoice.
 
-Three guards against matching an old payment: baseline, `since`, and the unique sats tag.
+Four guards against matching someone else's payment: baseline, `since`, the unique sats tag, and the exact amount.
 
 ### Detection sources (v1.2.0)
 
@@ -366,9 +450,12 @@ The check worker (`worker/`, `data-api=…`) stays in the repo as an option; it 
 
 ### Worker API (not deployed)
 
-`GET /api/pay/check?to=<address>&amount=<sats>&since=<unix>` →
-`{ "ok": true, "matches": [{ "txid": "…", "sats": 50037, "confirmations": 0 }] }`
-Errors: `400 bad_address|bad_amount|bad_since`, `429 rate_limited`, `503 upstream_busy` (+`Retry-After`), `502 upstream`.
+`GET /api/pay/check?to=<address>&amount=<sats>&since=<unix>[&match=exact|min]` →
+`{ "ok": true, "matches": [{ "txid": "…", "sats": 50037, "exact": true, "confirmations": 0 }] }`
+`match=exact` (default since v1.3.0) only returns exact amounts (an overpayment comes back with `overpaid: true`);
+`match=min` = old "at least" rule. The rate-limit key is salted with the secret `RL_SALT` (`wrangler secret put RL_SALT`,
+at least 32 characters; without it a random per-instance salt is used).
+Errors: `400 bad_address|bad_amount|bad_since|bad_match`, `429 rate_limited`, `503 upstream_busy` (+`Retry-After`), `502 upstream`.
 
 ## Security & privacy
 
@@ -376,20 +463,33 @@ Errors: `400 bad_address|bad_amount|bad_since`, `429 rate_limited`, `503 upstrea
 - All merchant input is rendered with `textContent` / `setAttribute` (no `innerHTML`); labels are length-capped
   and URL-encoded in the `bitcoin:` URI; the explorer link is built only from a validated 64-hex txid.
 - Shadow DOM + `:host{all:initial}` isolates the widget from the shop's CSS (tested with hostile CSS).
+- **User content (v1.3.0):** if other people can put HTML on your page (comments, reviews, forum posts, CMS editors,
+  plugins), they can also add a `data-kallubi-pay` button. Protect yourself with `data-allowed-to` (wrong address → no
+  QR) and, if possible, `data-mount="#your-shop"` (buttons outside that container are not mounted). Everything that
+  decides where money is checked or where buyer data goes is trusted config only (script tag / JS), never button markup.
+  `window.KallubiPay` is frozen and cannot be replaced; the loader ignores HTML elements that pretend to be
+  `KallubiPay`, `KallubiPayConfig` or `document.currentScript` (DOM clobbering).
+- **Closed shadow root (opt-in, `closedShadow: true`):** other scripts on the page can then not read the dialog
+  (e.g. the typed address) through `element.shadowRoot`. It is off by default because it is only defence in depth
+  (a hostile script on the same page can still read keystrokes or change the page), and it makes testing and some
+  accessibility / browser tools harder. The shipping address is kept out of bubbling events by default either way.
 - `data-order-id` is validated against a strict character set; random order references come from `crypto.getRandomValues`.
 - Browser events are UX only; payment decisions belong on the shop server (`verify/`).
 - No cookies, no localStorage, no analytics, no external fonts or CDNs. QR code is generated locally
   (vendored `qrcode-generator` 1.4.4, MIT). `fetch` uses `credentials:'omit'`, `referrerPolicy:'no-referrer'`.
 - With `data-shipping-url`, the only extra host the widget contacts is that merchant URL (validated: https only, no credentials in the URL).
+- Pin the version with Subresource Integrity (`/v/1.3.0/button.min.js` + `integrity`), see "Embed".
 - Shops with a strict CSP must allow `script-src https://pay.kallubi-bsv-explorer.de` and
-  `connect-src https://node.kallubi-bsv-explorer.de` plus the fallback API host from `src/button.js` (or the worker URL), plus `https://api.coingecko.com` and `https://data-api.ecb.europa.eu` when using `data-amount-fiat` or the default EUR confirmation line, and `https://arcade-eu-1.bsvblockchain.tech https://arcade-us-1.bsvblockchain.tech https://arcade.gorillapool.io` for the quick check. No `style-src 'unsafe-inline'` is needed in modern
+  `connect-src https://node.kallubi-bsv-explorer.de` plus the fallback API host from `src/button.js` (or the worker URL), plus `https://api.coingecko.com`, the fallback API host and `https://data-api.ecb.europa.eu` when using `data-amount-fiat` or the default EUR confirmation line, and `https://arcade-eu-1.bsvblockchain.tech https://arcade-us-1.bsvblockchain.tech https://arcade.gorillapool.io` for the quick check. No `style-src 'unsafe-inline'` is needed in modern
   browsers: the styles are applied as a constructable stylesheet inside the shadow root (tested with `style-src 'none'`).
 
 ## Files
 
 ```
 dist/button.js        readable bundle (src + vendored QR lib)
-dist/button.min.js    minified (~125 KB, ~41 KB gzip)  <- this is what shops embed (hosted as /button.js)
+dist/button.min.js    minified  <- hosted as /button.js (always the latest version)
+dist/v/1.3.0/         the same files for the immutable versioned path /v/1.3.0/ (use with integrity)
+dist/SRI.json         sha384 integrity hashes of the versioned files
 src/button.js         source
 vendor/               qrcode-generator 1.4.4 (MIT, Kazuhiko Arase)
 worker/               optional check proxy (Cloudflare Worker, wrangler.toml, NOT deployed)
@@ -397,15 +497,16 @@ verify/               server-side payment verification for shops (Node 18+, no d
 demo/index.html       two fake shops (light + dark), test mode
 tests/                headless Chromium (Playwright) + Node worker tests, incl. a live read-only mainnet check
 shots/                screenshots written by the tests (not in the repo)
-build.mjs             build: npm install && node build.mjs
+build.mjs             build: npm ci && node build.mjs (writes dist/v/<version>/ and dist/SRI.json)
+CHANGELOG.md          changes per version
 ```
 
 ## Develop / running tests
 
-Build needs `npm install` (terser). Browser tests need Python Playwright and Chrome.
+Build needs `npm ci` (terser, pinned in `package-lock.json`). Browser tests need Python Playwright and Chrome.
 
 ```bash
-npm install && node build.mjs
+npm ci && node build.mjs
 python3 -m http.server 8765 --bind 127.0.0.1 &      # then open http://127.0.0.1:8765/demo/
 python tests/test_widget.py                           # browser checks (needs playwright + chrome)
 python tests/test_confirm.py                          # 0-conf vs. 1-confirmation, chain mocked, strict CSP
@@ -416,11 +517,14 @@ python tests/test_realmode_smoke.py                   # real mode: own node firs
 python tests/test_node.py                             # source selection, forged hex/JSON, under/overpay, split outputs, orphaned, no double count, dropped vs. unreachable, parser fuzz
 python tests/e2e_regtest.py                           # optional: a REAL local regtest chain (setup not included; skipped unless KALLUBI_E2E_* are set)
 python tests/test_v120.py                             # fiat, order id, expiry/late, confirmation policy, v1.0.0 compatibility, strict CSP (all sources mocked)
+python tests/test_v130.py                             # v1.3.0: exact amount, allowlist, trusted config, baseline, size caps, rate cross-check, events
 node tests/worker.test.mjs                            # worker checks (mocked chain API + live read-only)
 node tests/verify.test.mjs                            # server-side verification (raw tx parser, amounts, replay, expiry, RPC, rates, confirmation policy)
 ```
 
 ## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for 1.3.0 and later.
 
 ### 1.2.0 — fiat prices, own-node detection, confirmation policy, server-side verification
 
@@ -445,7 +549,8 @@ Payment QR/button, confirmations (`data-confirm-above`), six languages (en, de, 
 ## Known limits
 
 - Mainnet P2PKH `1…` addresses only (no paymail, no P2SH, no testnet).
-- Fiat: EUR and USD only. Rate sources: CoinGecko, backup WhatsOnChain (+ ECB reference rate for EUR).
+- Fiat: EUR and USD only. Rate sources: CoinGecko, cross-checked with WhatsOnChain (+ ECB reference rate for EUR).
+- The widget does not check Merkle proofs yet (roadmap): confirmations come from the node / fallback answer.
 - Six UI languages; left-to-right scripts only.
 - Detection needs the own node or the public fallback to be reachable (with `data-fallback="0"`: the own node only).
 - A payment that arrives after the 15 min window is not shown in the dialog (the money still arrives

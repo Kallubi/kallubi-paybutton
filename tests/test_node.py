@@ -17,7 +17,7 @@ def check(name, cond, info=''):
 
 def mount(pg, attrs, wid='w', clear=True):
     pg.evaluate("""([a, id, clear]) => { const s = document.getElementById('slot'); if (clear) s.textContent = ''; const d = document.createElement('div');
-      d.setAttribute('data-kallubi-pay', ''); d.id = id; for (const k in a) d.setAttribute(k, a[k]); s.appendChild(d); }""", [attrs, wid, clear])
+      d.setAttribute('data-kallubi-pay', ''); d.id = id; const T = {'data-node': 'node', 'data-api': 'api', 'data-quick-ms': 'quickMs', 'data-fallback-url': 'fallbackUrl', 'data-broadcaster-url': 'broadcasterUrl', 'data-shipping-url': 'shippingUrl', 'data-shipping-email': 'shippingEmail'}; const o = Object.assign({}, a.__opts || {}); let use = !!a.__opts; for (const k in a) { if (k === '__opts') continue; if (T[k] && !(k === 'data-node' && a[k] === '')) { o[T[k]] = a[k]; use = true; } else d.setAttribute(k, a[k]); } if ('data-shipping' in a && !('shippingInEvents' in o)) { o.shippingInEvents = true; use = true; } if (use) KallubiPay.mount(d, o); s.appendChild(d); /* v1.3.0: trusted settings via KallubiPay.mount options */ }""", [attrs, wid, clear])
     pg.wait_for_function("(id) => document.querySelector('#' + id + ' .kallubi-pay-host')", arg=wid)
 def click(pg, wid='w'): pg.evaluate("(id) => document.querySelector('#' + id + ' .kallubi-pay-host').shadowRoot.querySelector('button').click()", wid)
 def invoice_sats(pg):
@@ -79,9 +79,13 @@ with sync_playwright() as pw:
     check('1 sat short, fallback JSON claims 100x: amount comes from raw hex only -> not paid', not ok, events(pg)); ctx.close()
     ctx, pg, ch, errs, inv, ok = pay_flow('index', pay=lambda c, i: setattr(c, 'pay_sats', i - 1), wait_ms=9000)
     check('underpayment by 1 sat: not paid', not ok); ctx.close()
-    ctx, pg, ch, errs, inv, ok = pay_flow('index', pay=lambda c, i: setattr(c, 'pay_sats', i + 500))
+    # v1.3.0: exact amount by default. More than the invoice -> kallubi:overpaid + note, never kallubi:paid
+    ctx, pg, ch, errs, inv, ok = pay_flow('index', pay=lambda c, i: setattr(c, 'pay_sats', i + 500), wait_ms=9000)
+    ov = events(pg, 'kallubi:overpaid'); d = ov[0]['d'] if ov else {}
+    check('overpayment (default exact): not paid, kallubi:overpaid with the real amount', not ok and d.get('sats') == inv + 500 and d.get('requestedSats') == inv, [ok, d]); ctx.close()
+    ctx, pg, ch, errs, inv, ok = pay_flow('index', pay=lambda c, i: setattr(c, 'pay_sats', i + 500), attrs={'__opts': {'acceptOverpay': True}})
     d = events(pg, 'kallubi:paid')[0]['d'] if ok else {}
-    check('overpayment: paid with the real (higher) amount', ok and d.get('sats') == inv + 500 and d.get('requestedSats') == inv, d); ctx.close()
+    check('overpayment with acceptOverpay (JS opt-in): paid with the real (higher) amount', ok and d.get('sats') == inv + 500 and d.get('requestedSats') == inv, d); ctx.close()
     ctx, pg, ch, errs, inv, ok = pay_flow('index', pay=lambda c, i: c.set_tx([(i, OTHER)]), wait_ms=9000)
     check('right amount to a different address: not paid', not ok); ctx.close()
     ctx, pg, ch, errs, inv, ok = pay_flow('index', pay=lambda c, i: c.set_tx([(i // 2, SCRIPT), (0, '006a0101'), (i - i // 2, SCRIPT)]))

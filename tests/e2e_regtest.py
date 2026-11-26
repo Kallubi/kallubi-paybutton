@@ -58,7 +58,7 @@ check('setup: indexer synced, explorer-api up', st and http_get(NODE_URL.replace
 
 def mount(pg, attrs):
     pg.evaluate("""(a) => { const s = document.getElementById('slot'); s.textContent = ''; const d = document.createElement('div');
-      d.setAttribute('data-kallubi-pay', ''); d.id = 'w'; for (const k in a) d.setAttribute(k, a[k]); s.appendChild(d); }""", attrs)
+      d.setAttribute('data-kallubi-pay', ''); d.id = 'w'; const T = {'data-node': 'node', 'data-api': 'api', 'data-quick-ms': 'quickMs', 'data-fallback-url': 'fallbackUrl', 'data-broadcaster-url': 'broadcasterUrl', 'data-shipping-url': 'shippingUrl', 'data-shipping-email': 'shippingEmail'}; const o = Object.assign({}, a.__opts || {}); let use = !!a.__opts; for (const k in a) { if (k === '__opts') continue; if (T[k] && !(k === 'data-node' && a[k] === '')) { o[T[k]] = a[k]; use = true; } else d.setAttribute(k, a[k]); } if ('data-shipping' in a && !('shippingInEvents' in o)) { o.shippingInEvents = true; use = true; } if (use) KallubiPay.mount(d, o); s.appendChild(d); /* v1.3.0: trusted settings via KallubiPay.mount options */ }""", attrs)
     pg.wait_for_function("document.querySelector('#w .kallubi-pay-host')")
 def click(pg): pg.evaluate("document.querySelector('#w .kallubi-pay-host').shadowRoot.querySelector('button').click()")
 def inv_sats(pg): return round(float(pg.evaluate("document.querySelector('[data-kallubi-modal]').shadowRoot.querySelector('[data-amount]').getAttribute('data-amount')")) * 1e8)

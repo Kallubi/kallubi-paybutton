@@ -62,7 +62,7 @@ footer{max-width:1180px;margin:18px auto 0;font-size:12px;color:#78716c;display:
      <svg width="140" height="140" viewBox="0 0 100 100" aria-hidden="true"><path d="M34 14 L20 20 L8 36 L20 44 L26 38 L26 88 L74 88 L74 38 L80 44 L92 36 L80 20 L66 14 Q50 26 34 14Z" fill="#e4dccb" stroke="#cfc6b2" stroke-width="1.2"/><text x="50" y="62" text-anchor="middle" font-family="Inter,sans-serif" font-weight="800" font-size="9" fill="#a99f8b">EXAMPLE</text></svg></div>
     <div class="prod"><div class="sn">Example Shop</div><h3>Basic T-Shirt</h3><div class="desc">Demo product. Organic cotton, unisex fit.</div>
      <div class="price"><b>0.0005 BSV</b><span>· 50,000 sats</span></div>
-     <div id="btn-light" data-kallubi-pay data-confirm-above="0.01" data-to="1111111111111111111114oLvT2" data-amount="0.0005" data-label="Basic T-Shirt" data-merchant="Example Shop" data-order="EX-0001" data-theme="light" data-test="1" data-on-paid="demoPaid"></div>
+     <div id="btn-light" data-kallubi-pay data-confirm-above="0.01" data-to="1111111111111111111114oLvT2" data-amount="0.0005" data-label="Basic T-Shirt" data-merchant="Example Shop" data-order="EX-0001" data-theme="light" data-test="1"></div>
     </div>
    </div>
    <div class="notes"><b>White / off-white shop</b> with dark text and the same gold button. Darker gold (#b8860b) is used for text and links so they stay readable on white.
@@ -82,7 +82,7 @@ footer{max-width:1180px;margin:18px auto 0;font-size:12px;color:#78716c;display:
      <svg width="140" height="140" viewBox="0 0 100 100" aria-hidden="true"><path d="M34 14 L20 20 L8 36 L20 44 L26 38 L26 88 L74 88 L74 38 L80 44 L92 36 L80 20 L66 14 Q50 26 34 14Z" fill="#2e2e38" stroke="#4a4a56" stroke-width="1.2"/><text x="50" y="62" text-anchor="middle" font-family="Inter,sans-serif" font-weight="800" font-size="9" fill="#6b6b76">EXAMPLE</text></svg></div>
     <div class="prod"><div class="sn">Night Shop</div><h3>Gold Logo Hoodie</h3><div class="desc">Demo product. Heavy cotton, embroidered logo.</div>
      <div class="price"><b>0.0012 BSV</b><span>· 120,000 sats</span></div>
-     <div id="btn-dark" data-kallubi-pay data-confirm-above="0.01" data-to="1111111111111111111114oLvT2" data-amount="0.0012" data-label="Gold Logo Hoodie" data-merchant="Night Shop" data-order="NS-1042" data-theme="dark" data-test="1" data-on-paid="demoPaid"></div>
+     <div id="btn-dark" data-kallubi-pay data-confirm-above="0.01" data-to="1111111111111111111114oLvT2" data-amount="0.0012" data-label="Gold Logo Hoodie" data-merchant="Night Shop" data-order="NS-1042" data-theme="dark" data-test="1"></div>
     </div>
    </div>
    <div class="notes"><b>Black background, gold accents.</b> Matches the Kallubi look. With <b>data-theme="auto"</b> the widget follows the visitor's light/dark system setting.
@@ -97,11 +97,13 @@ footer{max-width:1180px;margin:18px auto 0;font-size:12px;color:#78716c;display:
 <div class="log" id="log"><b>kallubi:paid</b> events appear here (test mode simulates them).</div>
 <div class="code">&lt;script src="https://pay.kallubi-bsv-explorer.de/button.js" defer&gt;&lt;/script&gt;
 &lt;div data-kallubi-pay data-to="YOUR_BSV_ADDRESS" data-amount="0.0005" data-label="Basic T-Shirt" data-theme="auto" data-confirm-above="0.01"&gt;&lt;/div&gt;</div>
-<footer><span>Kallubi Pay Button v1.0.0 · local demo · all names, amounts and transaction IDs are fake</span><span>Non-custodial · no cookies · no tracking</span></footer>
+<footer><span>Kallubi Pay Button v1.3.0 · local demo · all names, amounts and transaction IDs are fake</span><span>Non-custodial · no cookies · no tracking</span></footer>
 
 <script>
-  // merchant-side hooks (both are optional)
+  // merchant-side hooks (both are optional). v1.3.0: callbacks are registered from the shop's own JavaScript
+  // (window.KallubiPayConfig before the script, or KallubiPay.onPaid(fn) after it), never from button markup.
   function demoPaid(d) { window.__lastCallback = d; }
+  window.KallubiPayConfig = { onPaid: demoPaid };
   document.addEventListener('kallubi:paid', function (e) {
     var d = e.detail, log = document.getElementById('log');
     window.__paidEvents = (window.__paidEvents || []).concat([d]);

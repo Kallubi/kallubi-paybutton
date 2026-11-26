@@ -53,7 +53,7 @@ def wait(pg, js, ms=15000):
 def W(v): return "(() => { const h = document.querySelector('[data-kallubi-modal]'); return !!h && h.shadowRoot.querySelector('.modal').dataset.view === '%s'; })()" % v
 def mount(pg, attrs):
     pg.evaluate("""(a) => { const s = document.getElementById('slot'); s.textContent = ''; const d = document.createElement('div');
-      d.setAttribute('data-kallubi-pay', ''); d.id = 'w'; for (const k in a) d.setAttribute(k, a[k]); s.appendChild(d); window.__ev = []; }""", attrs)
+      d.setAttribute('data-kallubi-pay', ''); d.id = 'w'; const T = {'data-node': 'node', 'data-api': 'api', 'data-quick-ms': 'quickMs', 'data-fallback-url': 'fallbackUrl', 'data-broadcaster-url': 'broadcasterUrl', 'data-shipping-url': 'shippingUrl', 'data-shipping-email': 'shippingEmail'}; const o = Object.assign({}, a.__opts || {}); let use = !!a.__opts; for (const k in a) { if (k === '__opts') continue; if (T[k] && !(k === 'data-node' && a[k] === '')) { o[T[k]] = a[k]; use = true; } else d.setAttribute(k, a[k]); } if ('data-shipping' in a && !('shippingInEvents' in o)) { o.shippingInEvents = true; use = true; } if (use) KallubiPay.mount(d, o); s.appendChild(d); /* v1.3.0: trusted settings via KallubiPay.mount options */ window.__ev = []; }""", attrs)
     pg.wait_for_function("document.querySelector('#w .kallubi-pay-host')")
 def click(pg): pg.evaluate("document.querySelector('#w .kallubi-pay-host').shadowRoot.querySelector('button').click()")
 def close(pg):
@@ -109,7 +109,7 @@ with sync_playwright() as pw:
         nm = 'config error' if i == len(snaps['old']) - 1 else 'cfg%d %s' % (i // 5 + 1, names[i % 5])
         check('off = v1.2.1: ' + nm, o == n and o != 'NOPAID', '' if o == n else [l for l in __import__('difflib').unified_diff(o.split('\n'), n.split('\n'), lineterm='', n=1)][2:14])
     pg.goto(BASE + '/tests/ship.html'); pg.wait_for_function('window.KallubiPay')
-    check('version 1.2.0', pg.evaluate('KallubiPay.version') == '1.2.0')
+    check('version 1.3.0', pg.evaluate('KallubiPay.version') == '1.3.0')
     mount(pg, T); click(pg); wait(pg, W('waiting'))
     check('off: dialog opens straight in the QR step (no form)', view(pg) == 'waiting' and not modal(pg, "return !!r.querySelector('form')"))
     close(pg)
@@ -177,7 +177,7 @@ with sync_playwright() as pw:
         body = json.loads(RECEIVED[0]['body'])
         check('POST payload: txid, amount, tag, label, merchant, order, address', body['txid'] == pev[0]['txid'] and body['sats'] == pev[0]['sats'] and body['tag'] == body['requestedSats'] - 50000
               and body['label'] == 'Gold Logo Hoodie' and body['merchant'] == 'Merch Shop' and body['order'] == 'MS-7' and body['shipping'] == BUYER and body['test'] is True
-              and body['kallubi'] == 'shipping' and body['version'] == '1.2.0' and re.match(r'^MS-7$', body['orderId']) and body['serverVerify'] == 'required', body)
+              and body['kallubi'] == 'shipping' and body['version'] == '1.3.0' and re.match(r'^MS-7$', body['orderId']) and body['serverVerify'] == 'required', body)
         check('POST: JSON, no cookies, no referrer', RECEIVED[0]['ctype'] == 'application/json' and not RECEIVED[0]['cookie'] and not RECEIVED[0]['referer'], RECEIVED[0])
     pv = modal(pg, "return { s: r.querySelector('.shipbox') && r.querySelector('.shipbox').textContent, row: Array.from(r.querySelectorAll('.row')).map(x => x.textContent).join(' | '), mail: !!r.querySelector('[data-mailto]') }")
     check('paid view: "Address sent to the shop" + Ship-to row', pv['s'] == 'Address sent to the shop \u2713' and 'Ship toErika Mustermann, Musterstadt' in pv['row'] and not pv['mail'], pv)

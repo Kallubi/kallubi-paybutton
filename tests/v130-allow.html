@@ -1,0 +1,8 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Kallubi Pay v1.3.0 – allowlist fixture</title></head>
+<body>
+<div id="shop"><div id="good" data-kallubi-pay data-to="1111111111111111111114oLvT2" data-amount="0.0005" data-test="1" data-test-delay="600000"></div></div>
+<div id="reviews"><p>Great product! <div id="evil" data-kallubi-pay data-to="1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa" data-amount="0.0005"></div></p></div>
+<div id="slot"></div>
+<script src="../dist/button.min.js" data-allowed-to="1111111111111111111114oLvT2" data-shipping-email="orders@example-shop.test"></script>
+<script>window.__ev=[];['kallubi:paid','kallubi:seen','kallubi:dropped','kallubi:overpaid','kallubi:shipping','kallubi:late','kallubi:expired'].forEach(function(n){document.addEventListener(n,function(e){window.__ev.push({type:n,d:e.detail,id:(e.target.closest&&e.target.closest('[id]')||{}).id})})});</script>
+</body></html>

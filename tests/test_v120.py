@@ -21,7 +21,7 @@ def wait(pg, js, ms=15000):
 def W(v): return "(() => { const h = document.querySelector('[data-kallubi-modal]'); return !!h && h.shadowRoot.querySelector('.modal').dataset.view === '%s'; })()" % v
 def mount(pg, attrs):
     pg.evaluate("""(a) => { const s = document.getElementById('slot'); s.textContent = ''; const d = document.createElement('div');
-      d.setAttribute('data-kallubi-pay', ''); d.id = 'w'; for (const k in a) d.setAttribute(k, a[k]); s.appendChild(d); window.__ev = []; }""", attrs)
+      d.setAttribute('data-kallubi-pay', ''); d.id = 'w'; const T = {'data-node': 'node', 'data-api': 'api', 'data-quick-ms': 'quickMs', 'data-fallback-url': 'fallbackUrl', 'data-broadcaster-url': 'broadcasterUrl', 'data-shipping-url': 'shippingUrl', 'data-shipping-email': 'shippingEmail'}; const o = Object.assign({}, a.__opts || {}); let use = !!a.__opts; for (const k in a) { if (k === '__opts') continue; if (T[k] && !(k === 'data-node' && a[k] === '')) { o[T[k]] = a[k]; use = true; } else d.setAttribute(k, a[k]); } if ('data-shipping' in a && !('shippingInEvents' in o)) { o.shippingInEvents = true; use = true; } if (use) KallubiPay.mount(d, o); s.appendChild(d); /* v1.3.0: trusted settings via KallubiPay.mount options */ window.__ev = []; }""", attrs)
     pg.wait_for_function("document.querySelector('#w .kallubi-pay-host')")
 def btn_text(pg): return pg.evaluate("(() => { const r = document.querySelector('#w .kallubi-pay-host').shadowRoot; const b = r.querySelector('button'); return b ? b.textContent.replace('\u20bf', '') : r.textContent; })()")
 def click(pg): pg.evaluate("document.querySelector('#w .kallubi-pay-host').shadowRoot.querySelector('button').click()")
@@ -150,7 +150,7 @@ with sync_playwright() as pw:
     src_line = modal(pg, "const e = r.querySelector('.rate.src'); return e && [e.textContent, e.dataset.rateSource];")
     check('fiat: rate source is shown ("Rate source: CoinGecko")', src_line == ['Rate source: CoinGecko', 'coingecko'], src_line)
     check('order: data-order-id shown as text in the header', 'Order #ORD-2026/11#42' in w['sub'], w['sub'])
-    check('fiat: only CoinGecko was asked in test mode (no WhatsOnChain fallback needed)', all('coingecko' in c for c in net.calls) and len(net.calls) == 1, net.calls)
+    check('v1.3.0 fiat: CoinGecko + cross-check source (WhatsOnChain USD, ECB) asked, CoinGecko rate used', sum('coingecko' in c for c in net.calls) == 1 and any(c.endswith('/exchangerate') for c in net.calls) and len(net.calls) <= 3, net.calls)
     check('fiat: rate request sends no referrer and no cookies', net.hdrs and all(not h.get('referer') and not h.get('cookie') for h in net.hdrs), net.hdrs[-1:])
     close(pg)
     mount(pg, dict(FIAT, **{'data-order-id': 'ORD-42', 'data-test-delay': '1500', 'data-test-confirm-delay': '1000'}))   # 25 EUR > 20 EUR: waits for 1 conf (simulated)
@@ -199,7 +199,11 @@ with sync_playwright() as pw:
     check('EUR backup: data-fallback="0" -> CoinGecko only, no WhatsOnChain/ECB request, no QR', wait(pg, W('rate'), 12000) and all('coingecko' in c for c in net.calls), net.calls)
     close(pg)
     net.ecb = 'old5'; net.calls.clear()
-    mount(pg, dict(FIAT, **{'data-test-delay': '1500', 'data-test-confirm-delay': '800'})); click(pg)
+    mount(pg, dict(FIAT)); click(pg)
+    check('v1.3.0 rate-check: CoinGecko down, only one source left -> no QR by default (two sources required)', wait(pg, W('rate'), 12000) and modal(pg, "return r.querySelectorAll('.qrwrap').length;") == 0, [view(pg), net.calls])
+    close(pg); net.calls.clear()
+    # the single-source backup below is the explicit opt-in rateSources: 1 (trusted JS config), i.e. the pre-1.3 behaviour
+    mount(pg, dict(FIAT, **{'data-test-delay': '1500', 'data-test-confirm-delay': '800', '__opts': {'rateSources': 1}})); click(pg)
     ok = wait(pg, W('waiting'))
     eur = 14.25 / 1.0963; micro = round(eur * 1e6); want = -(-2500 * 10**12 // micro)
     w = modal(pg, "const a = r.querySelector('.amt .v'), s = r.querySelector('.rate.src'); return [a && a.dataset.amount, s && s.textContent, s && s.dataset.rateSource];")
@@ -209,11 +213,11 @@ with sync_playwright() as pw:
     check('EUR backup: event names the source and both rates (rateSource, usdRate, ecbRate, ecbDate)', f.get('rateSource') == 'whatsonchain+ecb' and f.get('usdRate') == '14.25' and f.get('ecbRate') == '1.0963' and re.match(r'^\d{4}-\d{2}-\d{2}$', f.get('ecbDate', '')), f)
     close(pg)
     net.ecb = 'down'; net.calls.clear()
-    mount(pg, dict(FIAT)); click(pg)
+    mount(pg, dict(FIAT, **{'__opts': {'rateSources': 1}})); click(pg)
     check('EUR backup: ECB answer is cached (ECB down later -> still quotes, no new ECB request)', wait(pg, W('waiting'), 12000) and not any('ecb' in c for c in net.calls), net.calls)
     close(pg)
     net.ecb = 'ok'
-    mount(pg, dict(FIAT, **{'data-lang': 'de'})); click(pg); wait(pg, W('waiting'))
+    mount(pg, dict(FIAT, **{'data-lang': 'de', '__opts': {'rateSources': 1}})); click(pg); wait(pg, W('waiting'))
     s_de = modal(pg, "return (r.querySelector('.rate.src')||{}).textContent;")
     check('EUR backup DE: "Kursquelle: WhatsOnChain (USD) x EZB..." line', s_de and s_de.startswith('Kursquelle: WhatsOnChain (USD)'), s_de)
     close(pg)
@@ -274,7 +278,10 @@ with sync_playwright() as pw:
     close(pg)
 
     net.cg = 'down'; net.woc = 'ok'; net.calls.clear()
-    mount(pg, dict(FIAT, **{'data-currency': 'USD', 'data-amount-fiat': '10', 'data-test-delay': '1200', 'data-test-confirm-delay': '800'})); click(pg)
+    mount(pg, dict(FIAT, **{'data-currency': 'USD', 'data-amount-fiat': '10'})); click(pg)
+    check('v1.3.0 rate-check: USD, CoinGecko down -> no QR by default', wait(pg, W('rate'), 12000), view(pg))
+    close(pg); net.calls.clear()
+    mount(pg, dict(FIAT, **{'data-currency': 'USD', 'data-amount-fiat': '10', 'data-test-delay': '1200', 'data-test-confirm-delay': '800', '__opts': {'rateSources': 1}})); click(pg)
     ok = wait(pg, W('waiting'))
     a = modal(pg, "return r.querySelector('.amt .v') && r.querySelector('.amt .v').dataset.amount;")
     check('rate USD: CoinGecko down -> WhatsOnChain USD fallback (10.00 USD at 14.25 = 70175439 sats)', ok and a == '0.70175439' and any(c.endswith('/exchangerate') for c in net.calls), [a, net.calls])
@@ -337,7 +344,7 @@ with sync_playwright() as pw:
     new_sats = int(round(float(modal(pg, "return r.querySelector('.amt .v').dataset.amount;")) * 1e8))
     pg.wait_for_timeout(3200)
     le = events(pg, 'kallubi:late'); pe = events(pg, 'kallubi:paid') + events(pg, 'kallubi:seen')
-    if old_sats >= new_sats:   # the late tx also pays the open invoice -> it counts for the open one
+    if old_sats == new_sats:   # v1.3.0: only a tx with EXACTLY the open invoice amount counts for the open one
         check('late vs. open invoice: tx that also pays the open invoice is credited to it (paid), not flagged late', not le and pe and view(pg) in ('paid', 'confirming'), [old_sats, new_sats, le, view(pg)])
     else:
         check('late: old invoice paid late while a new invoice is open -> kallubi:late for the OLD orderId; new invoice not hijacked',
@@ -353,7 +360,7 @@ with sync_playwright() as pw:
     n1 = len(net.calls); net.eur = 13.00
     modal(pg, "r.querySelector('.btn.gold').click(); return 1;"); wait(pg, W('waiting'))
     a = modal(pg, "return r.querySelector('.amt .v') && r.querySelector('.amt .v').dataset.amount;")
-    check('fiat expiry: "Try again" re-quotes with a fresh rate (25.00 EUR at 13.00 = 192307693 sats)', len(net.calls) == n1 + 1 and a == '1.92307693', [n1, len(net.calls), a])
+    check('fiat expiry: "Try again" re-quotes with a fresh rate (25.00 EUR at 13.00 = 192307693 sats)', sum('coingecko' in c for c in net.calls[n1:]) == 1 and a == '1.92307693', [n1, net.calls[n1:], a])
     net.eur = 12.67
     close(pg)
 
@@ -388,7 +395,7 @@ with sync_playwright() as pw:
         snaps[ver] = ss
     vers = pg.evaluate('KallubiPay.version')
     diffs = [i for i in range(max(len(snaps['old']), len(snaps['new']))) if (snaps['old'][i:i+1] or [None]) != (snaps['new'][i:i+1] or [None])]
-    check('compat: without new attributes button + waiting/paid/confirming/expired DOM identical to v1.0.0 (%d snapshots)' % len(snaps['old']), not diffs and len(snaps['old']) == len(snaps['new']) and vers == '1.2.0',
+    check('compat: without new attributes button + waiting/paid/confirming/expired DOM identical to v1.0.0 (%d snapshots)' % len(snaps['old']), not diffs and len(snaps['old']) == len(snaps['new']) and vers == '1.3.0',
           diffs and list(__import__('difflib').unified_diff(str(snaps['old'][diffs[0]]).split('\n'), str(snaps['new'][diffs[0]]).split('\n'), lineterm='', n=1))[:14])
 
     # ================================================================ 10. strict CSP page with fiat

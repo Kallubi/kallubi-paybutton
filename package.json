@@ -1,3 +1,3 @@
-{ "name": "kallubi-paybutton", "version": "1.2.0", "private": true, "license": "Apache-2.0",
+{ "name": "kallubi-paybutton", "version": "1.3.0", "private": true, "license": "Apache-2.0",
   "devDependencies": { "terser": "5.51.2" },
   "scripts": { "build": "node build.mjs", "test:worker": "node tests/worker.test.mjs", "test:verify": "node tests/verify.test.mjs" } }

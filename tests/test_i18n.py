@@ -40,7 +40,7 @@ def W(v): return "(() => { const h = document.querySelector('[data-kallubi-modal
 def mount(pg, attrs, html_lang=None):
     pg.evaluate("""([a, l]) => { if (l === null) {} else if (l === '') document.documentElement.removeAttribute('lang'); else document.documentElement.setAttribute('lang', l);
       const s = document.getElementById('slot'); s.textContent = ''; const d = document.createElement('div');
-      d.setAttribute('data-kallubi-pay', ''); d.id = 'w'; for (const k in a) d.setAttribute(k, a[k]); s.appendChild(d); }""", [attrs, html_lang])
+      d.setAttribute('data-kallubi-pay', ''); d.id = 'w'; const T = {'data-node': 'node', 'data-api': 'api', 'data-quick-ms': 'quickMs', 'data-fallback-url': 'fallbackUrl', 'data-broadcaster-url': 'broadcasterUrl', 'data-shipping-url': 'shippingUrl', 'data-shipping-email': 'shippingEmail'}; const o = Object.assign({}, a.__opts || {}); let use = !!a.__opts; for (const k in a) { if (k === '__opts') continue; if (T[k] && !(k === 'data-node' && a[k] === '')) { o[T[k]] = a[k]; use = true; } else d.setAttribute(k, a[k]); } if ('data-shipping' in a && !('shippingInEvents' in o)) { o.shippingInEvents = true; use = true; } if (use) KallubiPay.mount(d, o); s.appendChild(d); /* v1.3.0: trusted settings via KallubiPay.mount options */ }""", [attrs, html_lang])
     pg.wait_for_function("document.querySelector('#w .kallubi-pay-host')")
 def click(pg): pg.evaluate("document.querySelector('#w .kallubi-pay-host').shadowRoot.querySelector('button').click()")
 def close(pg): pg.keyboard.press('Escape')
@@ -64,7 +64,7 @@ with sync_playwright() as pw:
       const bad = []; K.languages.forEach(l => { const d = K.util.strings(l); Object.keys(en).forEach(k => { if (!d[k] || ph(d[k]) !== ph(en[k])) bad.push(l + '.' + k); });
         Object.keys(d).forEach(k => { if (!(k in en)) bad.push(l + '.' + k + '(extra)'); }); });
       return {version: K.version, langs: K.languages, keys: Object.keys(en).length, bad}; }""")
-    check('i18n: version 1.2.0, languages en/de/es/fr/it/pt', info['version'] == '1.2.0' and info['langs'] == ['en', 'de', 'es', 'fr', 'it', 'pt'], [info['version'], info['langs']])
+    check('i18n: version 1.3.0, languages en/de/es/fr/it/pt', info['version'] == '1.3.0' and info['langs'] == ['en', 'de', 'es', 'fr', 'it', 'pt'], [info['version'], info['langs']])
     check('i18n: every language has every key with the same {placeholders}', not info['bad'] and info['keys'] >= 45, [info['keys'], info['bad'][:5]])
     nl = pg.evaluate("['de','DE','de-AT','pt_BR',' fr ','it-IT','english','deutsch','xx','zh-CN','','auto',null].map(KallubiPay.util.normLang)")
     check('i18n: normLang ("de-AT" -> de, unknown -> null)', nl == ['de', 'de', 'de', 'pt', 'fr', 'it', None, None, None, None, None, None, None], nl)

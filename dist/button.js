@@ -1,20 +1,32 @@
-/*! Kallubi Pay Button v1.2.0 | Apache-2.0 | https://kallubi-bsv-explorer.de
+/*! Kallubi Pay Button v1.3.0 | Apache-2.0 | https://kallubi-bsv-explorer.de
  *  Non-custodial BSV pay button: the buyer pays straight to the merchant's own address.
  *  No keys, no seeds, no custody, no cookies, no tracking. Optional shipping address (data-shipping) goes only to the merchant.
  *  v1.2.0: optional EUR/USD pricing (data-amount-fiat), order reference (data-order-id), data-expires-min, late-payment flag.
+ *  v1.3.0: exact-amount matching, payee allowlist (data-allowed-to), trusted JS config (KallubiPay.config / onPaid),
+ *          two agreeing rate sources, 1 MB tx cap with async hashing, no matching without a baseline.
  *  The kallubi:paid event is a UX signal only. A shop must verify every payment on its own server (see verify/).
  *  Bundles qrcode-generator 1.4.4 (MIT, (c) 2009 Kazuhiko Arase). */
 (function () {
   'use strict';
-  if (typeof window === 'undefined' || (window.KallubiPay && window.KallubiPay.version)) return;
+  if (typeof window === 'undefined') return;
+  // v1.3.0 init guard: only a real earlier copy of this script stops a second init. A clobbered global
+  // (<form id="KallubiPay"><input name="version"></form>) is an element, has no functions and is ignored.
+  var EXISTING = window.KallubiPay;
+  if (EXISTING && typeof EXISTING === 'object' && !(typeof Node !== 'undefined' && EXISTING instanceof Node) &&
+    typeof EXISTING.version === 'string' && typeof EXISTING.mount === 'function') return;
+  // The <script> tag that loaded this file. document.currentScript can be clobbered (<img name="currentScript">), so only a
+  // real HTMLScriptElement counts. Its data-* attributes are trusted shop settings (user content cannot add a running script).
+  var OWN_SCRIPT = (function () {
+    try { var cs = document.currentScript; return typeof HTMLScriptElement !== 'undefined' && cs instanceof HTMLScriptElement ? cs : null; } catch (e) { return null; }
+  })();
 
-  var VERSION = '1.2.0';
+  var VERSION = '1.3.0';
   // Payment detection: Kallubi's own BSV node first. The public fallback is only used where the own node cannot answer
   // (no address index yet, node unreachable, tx not known yet). Amounts are never taken from JSON: every candidate tx is
   // fetched as raw hex, hashed (must equal the txid) and parsed here, so neither source can fake an amount.
   var NODE_API = 'https://node.kallubi-bsv-explorer.de/v1/bsv/main';
   var FALLBACK_API = 'https://api.whatsonchain.com/v1/bsv/main';
-  var MAX_TX_HEX = 32 * 1024 * 1024;   // raw tx up to 16 MB is verified in the browser; bigger payment txs are not plausible
+  var MAX_TX_HEX = 2 * 1024 * 1024;    // v1.3.0: raw tx up to 1 MB is verified in the browser; bigger payment txs are not plausible
   var DROP_CHECKS = 4;                 // a seen tx that no source knows any more for 4 checks in a row ...
   var DROP_MIN_MS = 120000;            // ... and at least 2 min after it was seen counts as dropped (double spend / evicted)
   var EXPLORER_TX = 'https://kallubi-bsv-explorer.de/?tx=';
@@ -33,7 +45,9 @@
   var RATE_WOC = FALLBACK_API + '/exchangerate';
   var RATE_MAX_AGE_S = 600;    // a rate older than 10 min is refused (no stale quote)
   var RATE_FUTURE_S = 300;     // a rate time more than 5 min in the future is refused (bad clock / bad data)
-  var RATE_MAX = 10000000;     // 1 BSV > 10,000,000 EUR/USD is treated as bad data
+  var RATE_MAX = 100000;       // v1.3.0: 1 BSV above 100,000 EUR/USD is treated as bad data (was 10,000,000)
+  var RATE_MIN = 0.5;          // v1.3.0: 1 BSV below 0.50 EUR/USD is treated as bad data
+  var RATE_MAX_DEV_PCT = 3;    // v1.3.0: two rate sources that differ by more than 3 % = no price offer
   // EUR backup when CoinGecko fails: WhatsOnChain USD rate / official ECB EUR/USD reference rate. The ECB daily XML cannot be
   // read by a browser (no CORS header); the ECB Data Portal publishes the same reference rate with CORS, so the button uses that.
   var RATE_ECB = 'https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A?lastNObservations=1&format=csvdata';
@@ -60,6 +74,8 @@
   var LATE_POLL_MS = 15000;
   var ORDER_RE = /^[A-Za-z0-9][A-Za-z0-9._:\/#-]{0,63}$/;
   var USED_TX = {};
+  var BASELINE_LATE_MS = 8000;           // a baseline read later than this after the invoice start does not swallow mempool txs
+  var BASELINE_TRIES = 3;                // after 3 failed baseline reads the dialog says "cannot check right now" (and keeps trying)
 
   /* ------------------------------------------------------------------ vendored QR lib */
   var qrcode = (function () {
@@ -2489,9 +2505,15 @@ var qrcode = function() {
   /** fiat rate (fiat per 1 BSV, a JSON number) -> integer micro units, or null if not usable */
   function rateMicro(r) {
     var n = typeof r === 'number' ? r : typeof r === 'string' && /^\d{1,8}(\.\d{1,12})?$/.test(r) ? Number(r) : NaN;
-    if (!isFinite(n) || n <= 0 || n > RATE_MAX) return null;
+    if (!isFinite(n) || n < RATE_MIN || n > RATE_MAX) return null;
     var u = Math.round(n * 1e6);
     return u >= 1 ? u : null;
+  }
+  /** v1.3.0: true when two rates (micro units) differ by at most RATE_MAX_DEV_PCT of the smaller one (integer math) */
+  function ratesAgree(aMicro, bMicro) {
+    if (!(aMicro >= 1) || !(bMicro >= 1)) return false;
+    var lo = Math.min(aMicro, bMicro), hi = Math.max(aMicro, bMicro);
+    return (hi - lo) * 100 <= lo * RATE_MAX_DEV_PCT;
   }
   /** cents + rate (micro units) -> satoshis, rounded UP to the next whole satoshi so the shop never receives less than the price.
    *  sats = ceil(cents * 10^4 * 10^8 / rateMicro), computed with BigInt (exact). null if out of range or BigInt is missing. */
@@ -2551,24 +2573,40 @@ var qrcode = function() {
       return r;
     });
   }
-  /** current rate for EUR or USD. CoinGecko first. Backup (unless data-fallback="0"): USD = WhatsOnChain, EUR = WhatsOnChain USD
-   *  divided by the ECB EUR/USD reference rate. Rejects (no quote, no QR) if nothing fresh is available. */
-  function fetchRate(cur, backup) {
-    var cg = getJson(RATE_CG).then(function (j) {
+  /** second source: USD = WhatsOnChain, EUR = WhatsOnChain USD divided by the ECB EUR/USD reference rate */
+  function wocRate(cur) {
+    if (cur === 'USD') return wocUsd();
+    return Promise.all([wocUsd(), fetchEcb()]).then(function (a) {
+      var r = checkRate(a[0].rate / a[1].usdPerEur, a[0].ts, 'whatsonchain+ecb');
+      if (!r) throw new Error('rate');
+      r.usdRate = a[0].rate; r.ecbRate = a[1].usdPerEur; r.ecbDate = a[1].date;
+      return r;
+    });
+  }
+  /** Current rate for EUR or USD. v1.3.0: CoinGecko AND the second source (WhatsOnChain, for EUR combined with the ECB rate)
+   *  are asked in parallel. Both must answer with fresh, plausible rates that differ by at most 3 %, otherwise there is no
+   *  price offer (no QR). The CoinGecko rate is used (same rule as the Kallubi wallets); the second one is the cross-check.
+   *  minSources = 1 (trusted JS config rateSources: 1) accepts a single fresh source, the pre-1.3 behaviour. backup === false
+   *  (data-fallback="0") never asks WhatsOnChain, so it only gives a price with rateSources: 1. */
+  function fetchRate(cur, backup, minSources) {
+    var need = minSources === 1 ? 1 : 2;
+    var settle = function (p) { return p.then(function (r) { return r; }, function () { return null; }); };
+    var cg = settle(getJson(RATE_CG).then(function (j) {
       var o = j && j['bitcoin-cash-sv'], r = o ? checkRate(o[cur.toLowerCase()], o.last_updated_at, 'coingecko') : null;
       if (!r) throw new Error('rate');
       return r;
-    });
-    if (backup === false) return cg;
-    return cg.then(null, function () {
-      if (cur === 'USD') return wocUsd();
-      return Promise.all([wocUsd(), fetchEcb()]).then(function (a) {
-        var r = checkRate(a[0].rate / a[1].usdPerEur, a[0].ts, 'whatsonchain+ecb');
-        if (!r) throw new Error('rate');
-        r.usdRate = a[0].rate; r.ecbRate = a[1].usdPerEur; r.ecbDate = a[1].date;
-        return r;
-      });
-    });
+    }));
+    var second = backup === false ? Promise.resolve(null) : settle(wocRate(cur));
+    return Promise.all([cg, second]).then(function (a) { return pickRate(a[0], a[1], need); });
+  }
+  /** v1.3.0 decision for two rate answers (pure, exported for tests). a = primary, b = cross-check; null = no answer. */
+  function pickRate(a, b, need) {
+    if (a && b) {
+      if (!ratesAgree(a.micro, b.micro)) { var e = new Error('rate_mismatch'); e.code = 'rate_mismatch'; throw e; }
+      a.checkedBy = b.source; a.checkRate = b.rate; a.sources = 2; return a;
+    }
+    if (need === 1 && (a || b)) { var one = a || b; one.sources = 1; return one; }
+    throw new Error(a || b ? 'rate_single' : 'rate');
   }
   function srcName(q) {
     return q.source === 'coingecko' ? 'CoinGecko' : q.source === 'whatsonchain' ? 'WhatsOnChain'
@@ -2596,6 +2634,15 @@ var qrcode = function() {
     return b;
   }
   function txidOf(bytes) { var d = sha256(sha256(bytes)), r = new Uint8Array(32); for (var i = 0; i < 32; i++) r[i] = d[31 - i]; return toHex(r); }
+  /** v1.3.0: same txid, but hashed with the browser's native crypto.subtle (async, off the main JS loop) where available
+   *  (secure contexts). Falls back to the small sync SHA-256 above. Resolves the txid hex. */
+  var SUBTLE = (function () { try { var c = window.crypto; return c && c.subtle && typeof c.subtle.digest === 'function' ? c.subtle : null; } catch (e) { return null; } })();
+  function txidOfAsync(bytes) {
+    if (!SUBTLE) return Promise.resolve(txidOf(bytes));
+    return SUBTLE.digest('SHA-256', bytes).then(function (h1) { return SUBTLE.digest('SHA-256', h1); }).then(function (h2) {
+      var d = new Uint8Array(h2), r = new Uint8Array(32); for (var i = 0; i < 32; i++) r[i] = d[31 - i]; return toHex(r);
+    }, function () { return txidOf(bytes); });
+  }
   /** Full raw-tx parse: version, inputs (prevTxid/vout/script/sequence), outputs, locktime, size. Throws if malformed. */
   function parseTx(b) {
     var o = 0;
@@ -2786,13 +2833,35 @@ var qrcode = function() {
     }
     return { txStatus: st, ok: !!QUICK_GOOD[st], competing: false, extraInfo: j.extraInfo };
   }
+  /** sum of the outputs of parsed outs that pay exactly scriptHex; null if above MAX_SATS */
+  function satsTo(outs, scriptHex) {
+    var want = scriptHex.length / 2, sats = 0;
+    for (var i = 0; i < outs.length; i++) if (outs[i].script.length === want && toHex(outs[i].script) === scriptHex) sats += outs[i].value;
+    return sats > MAX_SATS ? null : sats;
+  }
   /** satoshis a raw tx (hex) pays to scriptHex; null if the hex is not exactly the tx `txid` or is malformed */
   function verifiedSats(hex, txid, scriptHex) {
     var b = hexBytes(hex); if (!b || txidOf(b) !== txid) return null;
     var outs; try { outs = txOutputs(b); } catch (e) { return null; }
-    var want = scriptHex.length / 2, sats = 0;
-    for (var i = 0; i < outs.length; i++) if (outs[i].script.length === want && toHex(outs[i].script) === scriptHex) sats += outs[i].value;
-    return sats > MAX_SATS ? null : sats;
+    return satsTo(outs, scriptHex);
+  }
+  /** v1.3.0 async variant used by the watchers. Parses first (cheap) and only hashes when the tx can matter:
+   *  minSats (optional) skips a tx that pays less than the invoice without hashing it (resolves {sats, skipped: true}).
+   *  Resolves {sats} for a verified tx (hash = txid), or null (malformed, too large, wrong hash). */
+  function verifiedSatsAsync(hex, txid, scriptHex, minSats) {
+    var b = hexBytes(hex); if (!b) return Promise.resolve(null);
+    var outs; try { outs = txOutputs(b); } catch (e) { return Promise.resolve(null); }
+    var sats = satsTo(outs, scriptHex); if (sats == null) return Promise.resolve(null);
+    if (minSats != null && sats < minSats) return Promise.resolve({ sats: sats, skipped: true });
+    return txidOfAsync(b).then(function (h) { return h === txid ? { sats: sats } : null; });
+  }
+  /** v1.3.0 exact-amount: how a verified amount relates to the invoice. 'exact' pays; 'over' only pays with acceptOverpay
+   *  (trusted JS config); otherwise it is reported as overpaid (contact the shop). 'under' never pays. */
+  function amountMatch(sats, want, acceptOverpay) {
+    if (!(typeof sats === 'number' && sats >= 1 && sats <= MAX_SATS) || !(want >= 1)) return 'under';
+    if (sats === want) return 'exact';
+    if (sats > want) return acceptOverpay ? 'exact' : 'over';
+    return 'under';
   }
 
   /* ------------------------------------------------------------------ i18n
@@ -2851,7 +2920,10 @@ var qrcode = function() {
       lateH: 'Payment arrived too late', lateP: 'Your payment was detected after the payment window had ended. Please do not pay again \u2013 contact the shop with your transaction ID so it can check the payment.', latePill: 'After the deadline',
       eFiat: 'invalid amount in data-amount-fiat (e.g. "25.00", max 2 decimals, 0.01 to 1000000.00)', eFiatCur: 'data-currency "{c}" is not supported with data-amount-fiat (EUR or USD)',
       eBoth: 'use either data-amount (BSV) or data-amount-fiat, not both', eCurFiat: 'for EUR or USD prices use data-amount-fiat',
-      eOrder: 'invalid data-order-id (1 to 64 characters: letters, digits and . _ - : / #)', eExp: 'invalid data-expires-min (whole minutes, 1 to 60)'
+      eOrder: 'invalid data-order-id (1 to 64 characters: letters, digits and . _ - : / #)', eExp: 'invalid data-expires-min (whole minutes, 1 to 60)',
+      /* v1.3.0 */
+      eToNotAllowed: 'this address is not in the shop\'s allowed list (data-allowed-to on the script tag)', noCheck: 'Cannot check for payments right now. Retrying\u2026',
+      overpaid: 'A payment of {a} BSV (more than this invoice) reached this address. If it was yours, please contact the shop with transaction {tx}.'
     },
     de: {
       payWith: 'Mit BSV bezahlen', payAmount: '{a} BSV bezahlen', paidBtn: 'Bezahlt \u2713', seenBtn: 'Zahlung erkannt \u2013 wird best\u00e4tigt\u2026',
@@ -2905,7 +2977,10 @@ var qrcode = function() {
       lateH: 'Zahlung kam zu sp\u00e4t', lateP: 'Deine Zahlung wurde erst nach Ablauf des Zahlungsfensters erkannt. Bitte nicht noch einmal zahlen \u2013 melde dich mit deiner Transaktions-ID beim Shop, damit er die Zahlung pr\u00fcfen kann.', latePill: 'Nach Ablauf',
       eFiat: 'ung\u00fcltiger Betrag in data-amount-fiat (z. B. "25.00", max. 2 Nachkommastellen, 0.01 bis 1000000.00)', eFiatCur: 'data-currency "{c}" wird mit data-amount-fiat nicht unterst\u00fctzt (EUR oder USD)',
       eBoth: 'entweder data-amount (BSV) oder data-amount-fiat verwenden, nicht beides', eCurFiat: 'f\u00fcr Preise in EUR oder USD data-amount-fiat verwenden',
-      eOrder: 'ung\u00fcltige data-order-id (1 bis 64 Zeichen: Buchstaben, Ziffern und . _ - : / #)', eExp: 'ung\u00fcltiges data-expires-min (ganze Minuten, 1 bis 60)'
+      eOrder: 'ung\u00fcltige data-order-id (1 bis 64 Zeichen: Buchstaben, Ziffern und . _ - : / #)', eExp: 'ung\u00fcltiges data-expires-min (ganze Minuten, 1 bis 60)',
+      /* v1.3.0 */
+      eToNotAllowed: 'diese Adresse steht nicht in der erlaubten Liste des Shops (data-allowed-to am Script-Tag)', noCheck: 'Zahlungen k\u00f6nnen gerade nicht gepr\u00fcft werden. Neuer Versuch l\u00e4uft\u2026',
+      overpaid: 'Eine Zahlung \u00fcber {a} BSV (mehr als diese Rechnung) ist an dieser Adresse eingegangen. Falls sie von dir ist, melde dich bitte mit der Transaktion {tx} beim Shop.'
     },
     es: {
       payWith: 'Pagar con BSV', payAmount: 'Pagar {a} BSV', paidBtn: 'Pagado \u2713', seenBtn: 'Pago detectado \u2013 confirmando\u2026',
@@ -2959,7 +3034,10 @@ var qrcode = function() {
       lateH: 'El pago lleg\u00f3 tarde', lateP: 'Tu pago se detect\u00f3 despu\u00e9s de que terminara el plazo de pago. No vuelvas a pagar: contacta con la tienda indicando tu ID de transacci\u00f3n para que revise el pago.', latePill: 'Fuera de plazo',
       eFiat: 'importe no v\u00e1lido en data-amount-fiat (p. ej. "25.00", m\u00e1x. 2 decimales, 0.01 a 1000000.00)', eFiatCur: 'data-currency "{c}" no es compatible con data-amount-fiat (EUR o USD)',
       eBoth: 'usa data-amount (BSV) o data-amount-fiat, no ambos', eCurFiat: 'para precios en EUR o USD usa data-amount-fiat',
-      eOrder: 'data-order-id no v\u00e1lido (1 a 64 caracteres: letras, d\u00edgitos y . _ - : / #)', eExp: 'data-expires-min no v\u00e1lido (minutos enteros, 1 a 60)'
+      eOrder: 'data-order-id no v\u00e1lido (1 a 64 caracteres: letras, d\u00edgitos y . _ - : / #)', eExp: 'data-expires-min no v\u00e1lido (minutos enteros, 1 a 60)',
+      /* v1.3.0 */
+      eToNotAllowed: 'esta direcci\u00f3n no est\u00e1 en la lista permitida de la tienda (data-allowed-to en la etiqueta script)', noCheck: 'Ahora no se pueden comprobar los pagos. Reintentando\u2026',
+      overpaid: 'Ha llegado a esta direcci\u00f3n un pago de {a} BSV (m\u00e1s que esta factura). Si fue tuyo, contacta con la tienda indicando la transacci\u00f3n {tx}.'
     },
     fr: {
       payWith: 'Payer avec BSV', payAmount: 'Payer {a} BSV', paidBtn: 'Pay\u00e9 \u2713', seenBtn: 'Paiement d\u00e9tect\u00e9 \u2013 confirmation\u2026',
@@ -3013,7 +3091,10 @@ var qrcode = function() {
       lateH: 'Paiement arriv\u00e9 trop tard', lateP: 'Votre paiement a \u00e9t\u00e9 d\u00e9tect\u00e9 apr\u00e8s la fin du d\u00e9lai de paiement. Ne payez pas une seconde fois \u2013 contactez la boutique avec votre ID de transaction pour qu\u2019elle v\u00e9rifie le paiement.', latePill: 'Hors d\u00e9lai',
       eFiat: 'montant invalide dans data-amount-fiat (ex. "25.00", 2 d\u00e9cimales max., 0.01 \u00e0 1000000.00)', eFiatCur: 'data-currency "{c}" n\u2019est pas pris en charge avec data-amount-fiat (EUR ou USD)',
       eBoth: 'utilisez data-amount (BSV) ou data-amount-fiat, pas les deux', eCurFiat: 'pour des prix en EUR ou USD, utilisez data-amount-fiat',
-      eOrder: 'data-order-id invalide (1 \u00e0 64 caract\u00e8res : lettres, chiffres et . _ - : / #)', eExp: 'data-expires-min invalide (minutes enti\u00e8res, 1 \u00e0 60)'
+      eOrder: 'data-order-id invalide (1 \u00e0 64 caract\u00e8res : lettres, chiffres et . _ - : / #)', eExp: 'data-expires-min invalide (minutes enti\u00e8res, 1 \u00e0 60)',
+      /* v1.3.0 */
+      eToNotAllowed: 'cette adresse ne figure pas dans la liste autoris\u00e9e de la boutique (data-allowed-to sur la balise script)', noCheck: 'Impossible de v\u00e9rifier les paiements pour le moment. Nouvel essai\u2026',
+      overpaid: 'Un paiement de {a} BSV (plus que cette facture) est arriv\u00e9 sur cette adresse. S\u2019il vient de vous, contactez la boutique avec la transaction {tx}.'
     },
     it: {
       payWith: 'Paga con BSV', payAmount: 'Paga {a} BSV', paidBtn: 'Pagato \u2713', seenBtn: 'Pagamento rilevato \u2013 conferma in corso\u2026',
@@ -3067,7 +3148,10 @@ var qrcode = function() {
       lateH: 'Pagamento arrivato in ritardo', lateP: 'Il tuo pagamento \u00e8 stato rilevato dopo la scadenza della finestra di pagamento. Non pagare di nuovo \u2013 contatta il negozio con il tuo ID transazione, cos\u00ec potr\u00e0 verificare il pagamento.', latePill: 'Oltre la scadenza',
       eFiat: 'importo non valido in data-amount-fiat (es. "25.00", max 2 decimali, da 0.01 a 1000000.00)', eFiatCur: 'data-currency "{c}" non \u00e8 supportata con data-amount-fiat (EUR o USD)',
       eBoth: 'usa data-amount (BSV) oppure data-amount-fiat, non entrambi', eCurFiat: 'per prezzi in EUR o USD usa data-amount-fiat',
-      eOrder: 'data-order-id non valido (da 1 a 64 caratteri: lettere, cifre e . _ - : / #)', eExp: 'data-expires-min non valido (minuti interi, da 1 a 60)'
+      eOrder: 'data-order-id non valido (da 1 a 64 caratteri: lettere, cifre e . _ - : / #)', eExp: 'data-expires-min non valido (minuti interi, da 1 a 60)',
+      /* v1.3.0 */
+      eToNotAllowed: 'questo indirizzo non \u00e8 nella lista consentita del negozio (data-allowed-to sul tag script)', noCheck: 'Al momento non \u00e8 possibile verificare i pagamenti. Nuovo tentativo\u2026',
+      overpaid: 'Un pagamento di {a} BSV (pi\u00f9 di questa fattura) \u00e8 arrivato a questo indirizzo. Se \u00e8 tuo, contatta il negozio indicando la transazione {tx}.'
     },
     pt: {
       payWith: 'Pagar com BSV', payAmount: 'Pagar {a} BSV', paidBtn: 'Pago \u2713', seenBtn: 'Pagamento detectado \u2013 confirmando\u2026',
@@ -3121,7 +3205,10 @@ var qrcode = function() {
       lateH: 'O pagamento chegou tarde', lateP: 'Seu pagamento foi detectado depois do fim do prazo de pagamento. N\u00e3o pague de novo \u2013 fale com a loja informando o ID da transa\u00e7\u00e3o para que ela verifique o pagamento.', latePill: 'Fora do prazo',
       eFiat: 'valor inv\u00e1lido em data-amount-fiat (ex. "25.00", m\u00e1x. 2 casas decimais, 0.01 a 1000000.00)', eFiatCur: 'data-currency "{c}" n\u00e3o \u00e9 suportada com data-amount-fiat (EUR ou USD)',
       eBoth: 'use data-amount (BSV) ou data-amount-fiat, n\u00e3o os dois', eCurFiat: 'para pre\u00e7os em EUR ou USD use data-amount-fiat',
-      eOrder: 'data-order-id inv\u00e1lido (1 a 64 caracteres: letras, d\u00edgitos e . _ - : / #)', eExp: 'data-expires-min inv\u00e1lido (minutos inteiros, 1 a 60)'
+      eOrder: 'data-order-id inv\u00e1lido (1 a 64 caracteres: letras, d\u00edgitos e . _ - : / #)', eExp: 'data-expires-min inv\u00e1lido (minutos inteiros, 1 a 60)',
+      /* v1.3.0 */
+      eToNotAllowed: 'este endere\u00e7o n\u00e3o est\u00e1 na lista permitida da loja (data-allowed-to na tag script)', noCheck: 'N\u00e3o \u00e9 poss\u00edvel verificar pagamentos agora. Tentando de novo\u2026',
+      overpaid: 'Um pagamento de {a} BSV (mais do que esta fatura) chegou a este endere\u00e7o. Se foi seu, contate a loja informando a transa\u00e7\u00e3o {tx}.'
     }
   };
   var LANGS = Object.keys(I18N);
@@ -3231,10 +3318,10 @@ var qrcode = function() {
     '.mbody .btn{margin-top:12px}',
     '.wait{display:flex;align-items:center;gap:12px;margin-top:14px;padding:11px 13px;border-radius:12px;background:var(--waitbg);border:1px dashed rgba(240,193,75,.4)}',
     '.spin{width:22px;height:22px;border-radius:50%;border:2.5px solid rgba(240,193,75,.22);border-top-color:#f0c14b;border-right-color:#f0c14b;animation:spin 1s linear infinite;flex:none}',
-    '.w1{font-size:14px;font-weight:600}.w2{font-size:12px;color:var(--mut)}',
+    '.w1{font-size:14px;font-weight:600}.w2{font-size:12px;color:var(--mut)}.w2.warn{color:#d97706}',
     '.timer{margin-left:auto;font:700 15px ui-monospace,Menlo,Consolas,monospace;color:#d4a017;background:var(--timerbg);border-radius:8px;padding:6px 10px;border:1px solid rgba(240,193,75,.3)}',
     '.bar{height:4px;border-radius:4px;background:var(--bar);margin-top:10px;overflow:hidden}.bar i{display:block;height:100%;width:100%;background:linear-gradient(90deg,#b8860b,#f0c14b);transition:width 1s linear}',
-    '.note{font-size:11.5px;color:var(--mut);text-align:center;margin-top:10px}',
+    '.note{font-size:11.5px;color:var(--mut);text-align:center;margin-top:10px}.note.warn{color:#d97706;font-weight:600}',
     '.mfoot{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 20px;border-top:1px solid var(--line);font-size:11.5px;color:var(--mut);background:var(--foot);border-radius:0 0 22px 22px}',
     '.ok{text-align:center;padding:8px 0 2px}',
     '.check{width:100px;height:100px;margin:8px auto 16px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#f5d76e,#f0c14b 45%,#d4a017 80%,#b8860b);display:grid;place-items:center;color:#1a1408;box-shadow:0 0 0 8px rgba(240,193,75,.1),0 0 0 18px rgba(240,193,75,.05),0 0 60px rgba(240,193,75,.35)}',
@@ -3317,9 +3404,10 @@ var qrcode = function() {
       return p.then(function (r) {
         if (r) return r;
         return getText(url).then(function (hex) {
-          var b = hexBytes(hex); if (!b || txidOf(b) !== txid) return null;
-          try { return { hex: hex, tx: parseTx(b) }; } catch (e) { return null; }
-        }, function () { return null; });
+          var b = hexBytes(hex), tx; if (!b) return null;
+          try { tx = parseTx(b); } catch (e) { return null; }
+          return txidOfAsync(b).then(function (h) { return h === txid ? { hex: hex, tx: tx } : null; });
+        }).then(null, function () { return null; });
       });
     }, Promise.resolve(null));
   }
@@ -3344,8 +3432,15 @@ var qrcode = function() {
   function quickCheck(o) {
     var hex = o.hex, txid = o.txid, roots = o.roots || BROADCASTERS, watchMs = o.watchMs || QUICK_WATCH_MS, started = Date.now();
     var b = hexBytes(hex), tx, outFee, prevouts;
-    if (!b || txidOf(b) !== txid) return Promise.resolve({ ok: false, reason: 'hex' });
+    if (!b) return Promise.resolve({ ok: false, reason: 'hex' });
     try { tx = parseTx(b); } catch (e) { return Promise.resolve({ ok: false, reason: 'hex' }); }
+    return txidOfAsync(b).then(function (h) {
+      if (h !== txid) return { ok: false, reason: 'hex' };
+      return quickCheckParsed(o, hex, txid, tx, roots, watchMs, started);
+    });
+  }
+  function quickCheckParsed(o, hex, txid, tx, roots, watchMs, started) {
+    var outFee, prevouts;
     if (!isTxFinal(tx, o.nowS, o.tipHeight)) return Promise.resolve({ ok: false, reason: 'not_final', hard: true, tx: tx });
     if (tx.inputs.length > QUICK_MAX_INPUTS) return Promise.resolve({ ok: false, reason: 'fee_unknown', inputs: tx.inputs.length });
     var budget = new Promise(function (res) { setTimeout(function () { res(null); }, o.prevBudgetMs || QUICK_PREV_BUDGET_MS); });
@@ -3421,7 +3516,9 @@ var qrcode = function() {
       }, function (e) { clearTimeout(t); throw e; });
   }
   var noop = function () { return null; };
-  /** Raw hex of tx h, verified against h: own node first, then the fallback. Resolves {sats} or null (not available yet). */
+  /** Raw hex of tx h, verified against h: own node first, then the fallback. Resolves {sats, hex, source} or null (not
+   *  available yet). v1.3.0: a tx that pays this address less than o.sats is reported as {sats, skipped: true} without
+   *  hashing (it can never match), so a stream of big unrelated txs cannot keep the buyer's browser busy. */
   function fetchVerified(o, h) {
     var srcs = [];
     if (o.node) srcs.push(o.node + '/tx/' + h + '/hex');
@@ -3430,10 +3527,13 @@ var qrcode = function() {
       return p.then(function (r) {
         if (r) return r;
         return getText(url).then(function (hex) {
-          var sats = hex == null ? null : verifiedSats(hex, h, o.script);
-          if (sats == null) return null;
-          return { sats: sats, hex: hex, source: o.node && url.indexOf(o.node) === 0 ? 'node' : 'fallback' };
-        }, noop);
+          if (hex == null) return null;
+          return verifiedSatsAsync(hex, h, o.script, o.sats).then(function (v) {
+            if (!v) return null;
+            if (v.skipped) return { sats: v.sats, skipped: true };
+            return { sats: v.sats, hex: hex, source: o.node && url.indexOf(o.node) === 0 ? 'node' : 'fallback' };
+          });
+        }).then(null, noop);
       });
     }, Promise.resolve(null));
   }
@@ -3468,15 +3568,18 @@ var qrcode = function() {
       }, function () { return { known: false, unreachable: true, confirmations: 0, blocktime: 0 }; });
     });
   }
+  /** node history -> hashes (unconfirmed first); out.unconf marks the mempool ones (v1.3.0, for a late baseline) */
   function historyHashes(j) {
-    var out = [];
-    if (j && typeof j === 'object' && !Array.isArray(j)) { out = out.concat(hashes(j.unconfirmed || []), hashes(j.confirmed || [])); }
+    var out = [], un = [];
+    if (j && typeof j === 'object' && !Array.isArray(j)) { un = hashes(j.unconfirmed || []); out = out.concat(un, hashes(j.confirmed || [])); }
+    out.unconf = {}; un.forEach(function (h) { out.unconf[h] = 1; });
     return out;
   }
 
   /** Direct mode: the buyer's browser reads the chain itself (own node first, public fallback where needed). */
   function Watcher(o) {
-    this.o = o; this.baseline = null; this.checked = {}; this.queue = []; this.n = 0; this.initTries = 0;
+    this.o = o; this.baseline = null; this.checked = {}; this.queue = []; this.n = 0; this.initTries = 0; this.started = Date.now();
+    this.baselineErr = false;                // v1.3.0: true after BASELINE_TRIES failed reads ("cannot check right now")
     this.addrNode = !!o.node;                // switches to the fallback for good once the node says "no address index"
   }
   Watcher.prototype.fallbackLists = function (withConfirmed) {
@@ -3484,7 +3587,12 @@ var qrcode = function() {
     if (!base) return Promise.reject(new Error('no address source'));
     var ps = [getJson(base + '/address/' + a + '/unconfirmed/history')];
     if (withConfirmed) ps.push(getJson(base + '/address/' + a + '/confirmed/history?order=desc&limit=20'));
-    return Promise.all(ps).then(function (rs) { var out = []; rs.forEach(function (r) { out = out.concat(hashes(r)); }); return out; });
+    return Promise.all(ps).then(function (rs) {
+      var out = [], un = hashes(rs[0]); out.unconf = {}; un.forEach(function (h) { out.unconf[h] = 1; });
+      rs.forEach(function (r) { out = out.concat(hashes(r)); });
+      out.unconf = {}; un.forEach(function (h) { out.unconf[h] = 1; });
+      return out;
+    });
   };
   Watcher.prototype.lists = function (withConfirmed) {
     var self = this;
@@ -3498,10 +3606,16 @@ var qrcode = function() {
   Watcher.prototype.step = function () {
     var self = this, o = this.o;
     if (!this.baseline) {
+      // v1.3.0 (baseline): without a baseline nothing is ever matched. Older versions fell back to an empty baseline after
+      // 3 failed reads, which could match an old payment of the same amount. Now the dialog says "cannot check right now"
+      // and the watcher keeps trying. A baseline that only arrives late (> 8 s after the invoice) keeps mempool txs out of
+      // it, so a payment made during the outage is still inspected (exact amount, not used before).
       return this.lists(true).then(function (hs) {
-        self.baseline = {}; hs.forEach(function (h) { self.baseline[h] = 1; }); return null;
+        var late = Date.now() - self.started > BASELINE_LATE_MS, un = hs.unconf || {};
+        var b = {}; hs.forEach(function (h) { if (!(late && un[h])) b[h] = 1; });
+        self.baseline = b; self.baselineErr = false; return null;
       }, function (e) {
-        if (++self.initTries >= 3) self.baseline = {};   // fall back to since-time + unique amount only
+        if (++self.initTries >= BASELINE_TRIES) self.baselineErr = true;
         throw e;
       });
     }
@@ -3521,52 +3635,169 @@ var qrcode = function() {
       }, Promise.resolve(null));
     });
   };
-  /** undefined = not available yet, null = not a payment for this invoice, else the match */
+  /** undefined = not available yet, null = not a payment for this invoice, else the match (m.overpaid = more than the invoice) */
   function inspectTx(o, h) {
     return fetchVerified(o, h).then(function (r) {
       if (!r) return undefined;
-      if (r.sats < o.sats) return null;
+      if (r.skipped || amountMatch(r.sats, o.sats, o.acceptOverpay) === 'under') return null;
       return txStatus(o, h).then(function (st) {
+            // v1.3.0 (status fail-closed): no status answer (429, 5xx, HTML instead of JSON, timeout) means age and
+            // confirmations are unknown, so this is NOT a match yet: not marked checked, the next list run re-queues it.
+            if (!st || (!st.known && st.unreachable)) return undefined;
             var m = matchTx({ txid: h, confirmations: st.confirmations, blocktime: st.blocktime }, h, o, r.sats);
             if (m) { m.hex = r.hex; m.source = r.source; }
             return m;
           });
     });
   }
-  /** tx: {txid, confirmations, blocktime}; sats: verified amount from the raw tx */
+  /** tx: {txid, confirmations, blocktime}; sats: verified amount from the raw tx.
+   *  v1.3.0 (exact-amount): only the exact invoice amount matches. More than the invoice returns a match flagged overpaid: true
+   *  (never "paid", the dialog asks the buyer to contact the shop) unless o.acceptOverpay (trusted JS config). */
   function matchTx(tx, h, o, sats) {
     if (!tx || String(tx.txid || '').toLowerCase() !== h || !/^[0-9a-f]{64}$/.test(h)) return null;
     var bt = Number(tx.blocktime || 0);
     if (bt && bt < o.since - 600) return null;          // mined before the invoice existed (10 min clock slack)
-    if (!(typeof sats === 'number' && sats >= o.sats && sats <= MAX_SATS)) return null;
-    return { txid: h, sats: sats, confirmations: Math.max(0, Math.floor(Number(tx.confirmations) || 0)) };
+    var kind = amountMatch(sats, o.sats, o.acceptOverpay);
+    if (kind === 'under') return null;
+    var m = { txid: h, sats: sats, confirmations: Math.max(0, Math.floor(Number(tx.confirmations) || 0)) };
+    if (kind === 'over') m.overpaid = true;
+    return m;
   }
 
   /** Proxy mode: browser -> Kallubi worker (/api/pay/check), shared edge cache + rate limit. */
-  function ApiWatcher(o) { this.o = o; this.baseline = null; }
+  function ApiWatcher(o) { this.o = o; this.baseline = null; this.started = Date.now(); this.checked = {}; this.initTries = 0; this.baselineErr = false; }
   ApiWatcher.prototype.step = function () {
     var self = this, o = this.o;
-    var u = o.api + (o.api.indexOf('?') < 0 ? '?' : '&') + 'to=' + encodeURIComponent(o.address) + '&amount=' + o.sats + '&since=' + o.since;
+    var u = o.api + (o.api.indexOf('?') < 0 ? '?' : '&') + 'to=' + encodeURIComponent(o.address) + '&amount=' + o.sats + '&since=' + o.since +
+      '&match=' + (o.acceptOverpay ? 'min' : 'exact');
     return getJson(u).then(function (j) {
-      var ms = j && Array.isArray(j.matches) ? j.matches : []; self.last = ms;
-      if (!self.baseline) { self.baseline = {}; ms.forEach(function (m) { self.baseline[m.txid] = 1; }); return null; }
+      if (!j || j.__404 || !Array.isArray(j.matches)) throw new Error('api');      // no list = no baseline, no match (baseline)
+      var ms = j.matches; self.last = ms;
+      if (!self.baseline) {
+        var late = Date.now() - self.started > BASELINE_LATE_MS;
+        self.baseline = {}; self.baselineErr = false;
+        ms.forEach(function (m) { if (m && !(late && !(Number(m.confirmations) > 0))) self.baseline[m.txid] = 1; });
+        return null;
+      }
       var cand = null;
       for (var i = 0; i < ms.length; i++) {
         var m = ms[i];
-        if (m && /^[0-9a-f]{64}$/.test(m.txid) && !self.baseline[m.txid] && !(o.used && o.used[m.txid]) && Number(m.sats) >= o.sats) { cand = m; break; }
+        if (m && /^[0-9a-f]{64}$/.test(m.txid) && !self.baseline[m.txid] && !self.checked[m.txid] && !(o.used && o.used[m.txid]) &&
+          amountMatch(Number(m.sats), o.sats, true) !== 'under') { cand = m; break; }
       }
       if (!cand) return null;
       // The worker's JSON is only a hint: the amount is re-checked from the raw tx (hash = txid) like in direct mode.
       if (!o.node && !o.fallback) return null;
       return fetchVerified(o, cand.txid).then(function (r) {
-        if (!r || r.sats < o.sats) return null;
+        if (!r) return null;
+        var kind = r.skipped ? 'under' : amountMatch(r.sats, o.sats, o.acceptOverpay);
+        if (kind === 'under') { self.checked[cand.txid] = 1; return null; }
         // confirmations from the node / fallback status, not from the worker
         return txStatus({ node: o.node, fallback: o.fallback, address: o.address }, cand.txid).then(function (st) {
-          return { txid: cand.txid, sats: r.sats, confirmations: st && st.known ? st.confirmations : 0, hex: r.hex, source: r.source };
+          // v1.3.0 (status fail-closed): no status answer = age unknown, never a match; not marked checked, retried next step
+          if (!st || (!st.known && st.unreachable)) return null;
+          self.checked[cand.txid] = 1;
+          if (st.known && st.blocktime && st.blocktime < o.since - 600) return null;   // mined before the invoice existed
+          var res = { txid: cand.txid, sats: r.sats, confirmations: st && st.known ? st.confirmations : 0, hex: r.hex, source: r.source };
+          if (kind === 'over') res.overpaid = true;
+          return res;
         });
       });
-    });
+    }).then(null, function (e) { if (!self.baseline && ++self.initTries >= BASELINE_TRIES) self.baselineErr = true; throw e; });
   };
+
+  /* ------------------------------------------------------------------ v1.3.0 trusted configuration
+   *  Per-button markup (<div data-kallubi-pay ...>) can come from places the shop does not fully control (CMS blocks,
+   *  product descriptions, reviews). So since v1.3.0 everything that changes WHERE money, data or trust goes is only read
+   *  from trusted places: (1) data-* attributes of the <script> tag that loads this file, (2) window.KallubiPayConfig set
+   *  before the script (a plain object only, a clobbered element is ignored), (3) KallubiPay.config({...}) and
+   *  KallubiPay.mount(el, {...}) from the shop's own JavaScript. Callbacks: KallubiPay.onPaid(fn) / KallubiPay.on(name, fn). */
+  var urlOk = function (v) { return typeof v === 'string' && /^https:\/\/[^\s"'<>]+$|^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/[^\s"'<>]*$/.test(v); };
+  var apiOk = function (v) { return typeof v === 'string' && (/^https:\/\/[^\s"'<>]+$|^\/[^\s"'<>]*$|^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/[^\s"'<>]*$/.test(v)); };
+  var CFG = { allowedTo: null, node: NODE_API, fallbackUrl: FALLBACK_API, broadcasterUrl: '', api: '', shippingUrl: '', shippingEmail: '',
+    quickMs: QUICK_WATCH_MS, acceptOverpay: false, rateSources: 2, shippingInEvents: false, closedShadow: false, mountScope: '', autoMount: true };
+  var HOOKS = {};   // event name without "kallubi:" -> [fn]
+  var HOOK_NAMES = { paid: 1, seen: 1, late: 1, dropped: 1, expired: 1, overpaid: 1, shipping: 1, 'shipping-sent': 1 };
+  var warned = {};
+  function warnOnce(k, msg) { if (warned[k]) return; warned[k] = 1; if (window.console) console.warn('[Kallubi Pay] ' + msg); }
+  function isPlain(o) {
+    if (!o || typeof o !== 'object') return false;
+    if (typeof Node !== 'undefined' && o instanceof Node) return false;
+    var pr = Object.getPrototypeOf(o); return pr === Object.prototype || pr === null;
+  }
+  /** "1abc… 1def…" / ["1abc…"] -> valid mainnet P2PKH addresses (invalid entries dropped with a warning); null = not given */
+  function parseAllowed(v) {
+    if (v == null) return null;
+    var list = Array.isArray(v) ? v : String(v).split(/[\s,;]+/), out = [];
+    list.forEach(function (a) { a = clean(a, 40); if (!a) return; if (addressScript(a)) { if (out.indexOf(a) < 0) out.push(a); } else warnOnce('allow-' + a, 'ignoring invalid address in allowedTo: ' + a); });
+    return out;      // an empty list (all invalid) allows nothing: fail closed
+  }
+  /** validated partial settings from a trusted object; unknown keys and bad values are ignored with a warning */
+  function trustedPart(o, where) {
+    var out = {}, k;
+    if (!isPlain(o)) return out;
+    var has = function (key) { return Object.prototype.hasOwnProperty.call(o, key) && o[key] !== undefined; };
+    if (has('allowedTo')) out.allowedTo = parseAllowed(o.allowedTo);
+    if (has('node')) { k = o.node === '' || o.node === false || o.node === null ? '' : String(o.node).replace(/\/+$/, ''); if (k === '' || urlOk(k)) out.node = k; else warnOnce('node' + where, 'ignoring invalid node URL (' + where + ')'); }
+    if (has('fallback') && (o.fallback === false || o.fallback === '0')) out.fallbackUrl = '';
+    if (has('fallbackUrl')) { k = o.fallbackUrl === '' || o.fallbackUrl === false || o.fallbackUrl === null ? '' : String(o.fallbackUrl).replace(/\/+$/, ''); if (k === '' || urlOk(k)) out.fallbackUrl = k; else warnOnce('fb' + where, 'ignoring invalid fallbackUrl (' + where + ')'); }
+    if (has('broadcasterUrl')) { k = String(o.broadcasterUrl || '').replace(/\/+$/, ''); if (k === '' || urlOk(k)) out.broadcasterUrl = k; else warnOnce('bc' + where, 'ignoring invalid broadcasterUrl (' + where + ')'); }
+    if (has('api')) { k = clean(o.api, 300); if (k === '' || apiOk(k)) out.api = k; else warnOnce('api' + where, 'ignoring invalid api URL (' + where + ')'); }
+    if (has('shippingUrl')) { k = clean(o.shippingUrl, 500); if (k === '' || shipUrlHost(k)) out.shippingUrl = k; else { out.shippingUrl = '!bad'; } }
+    if (has('shippingEmail')) { k = clean(o.shippingEmail, 120); if (k === '' || isEmail(k)) out.shippingEmail = k; else { out.shippingEmail = '!bad'; } }
+    if (has('quickMs')) { k = Math.round(Number(o.quickMs)); if (k >= QUICK_MIN_MS && k <= 15000) out.quickMs = k; else warnOnce('qm' + where, 'quickMs must be 3000-15000 (' + where + ')'); }
+    if (has('acceptOverpay')) out.acceptOverpay = o.acceptOverpay === true || o.acceptOverpay === '1' || o.acceptOverpay === 'true';
+    if (has('rateSources')) { k = Number(o.rateSources); if (k === 1 || k === 2) out.rateSources = k; else warnOnce('rs' + where, 'rateSources must be 1 or 2 (' + where + ')'); }
+    if (has('shippingInEvents')) out.shippingInEvents = o.shippingInEvents === true || o.shippingInEvents === '1';
+    if (has('closedShadow')) out.closedShadow = o.closedShadow === true || o.closedShadow === '1';
+    if (has('mount')) { k = clean(o.mount, 200); try { if (k) document.querySelectorAll(k); out.mountScope = k; } catch (e) { warnOnce('mnt', 'ignoring invalid mount selector'); } }
+    if (has('autoMount')) out.autoMount = !(o.autoMount === false || o.autoMount === '0' || o.autoMount === 'false');
+    ['onPaid', 'onSeen', 'onLate', 'onDropped', 'onExpired', 'onOverpaid', 'onShipping'].forEach(function (key) {
+      if (has(key)) { if (typeof o[key] === 'function') (out.hooks = out.hooks || {})[key.slice(2).toLowerCase()] = o[key]; else warnOnce(key + where, key + ' must be a function'); }
+    });
+    return out;
+  }
+  /** merge a trusted part into CFG. allowedTo can only get narrower once it is set (a later call cannot widen it). */
+  function applyGlobal(part) {
+    Object.keys(part).forEach(function (k) {
+      if (k === 'hooks') { Object.keys(part.hooks).forEach(function (n) { addHook(n, part.hooks[n]); }); return; }
+      if (k === 'allowedTo') {
+        if (part.allowedTo == null) return;
+        CFG.allowedTo = CFG.allowedTo == null ? part.allowedTo.slice() : CFG.allowedTo.filter(function (a) { return part.allowedTo.indexOf(a) >= 0; });
+        return;
+      }
+      CFG[k] = part[k];
+    });
+  }
+  function addHook(name, fn) {
+    if (!HOOK_NAMES[name] || typeof fn !== 'function') return function () {};
+    (HOOKS[name] = HOOKS[name] || []).push(fn);
+    return function () { var a = HOOKS[name] || [], i = a.indexOf(fn); if (i >= 0) a.splice(i, 1); };
+  }
+  function payeeAllowed(addr, extra) {
+    if (CFG.allowedTo != null && CFG.allowedTo.indexOf(addr) < 0) return false;
+    if (extra && extra.allowedTo != null && extra.allowedTo.indexOf(addr) < 0) return false;
+    return true;
+  }
+  (function readTrustedAtLoad() {
+    if (OWN_SCRIPT) {
+      var g = function (n) { return OWN_SCRIPT.getAttribute(n); }, o = {};
+      if (g('data-allowed-to') != null) o.allowedTo = g('data-allowed-to');
+      if (g('data-mount') != null) o.mount = g('data-mount');
+      if (g('data-auto-mount') != null) o.autoMount = g('data-auto-mount');
+      if (g('data-shipping-url') != null) o.shippingUrl = g('data-shipping-url');
+      if (g('data-shipping-email') != null) o.shippingEmail = g('data-shipping-email');
+      if (g('data-api') != null) o.api = g('data-api');
+      if (g('data-rate-sources') != null) o.rateSources = g('data-rate-sources');
+      applyGlobal(trustedPart(o, 'script tag'));
+    }
+    var pre; try { pre = window.KallubiPayConfig; } catch (e) { pre = null; }
+    if (pre != null) { if (isPlain(pre)) applyGlobal(trustedPart(pre, 'KallubiPayConfig')); else warnOnce('preclob', 'ignoring window.KallubiPayConfig: not a plain object'); }
+  })();
+  // markup attributes that were honoured before v1.3.0 and are now trusted-config only
+  var MOVED_ATTRS = [['node', 'data-node', 'node'], ['fallbackUrl', 'data-fallback-url', 'fallbackUrl'], ['broadcasterUrl', 'data-broadcaster-url', 'broadcasterUrl'],
+    ['quickMs', 'data-quick-ms', 'quickMs'], ['api', 'data-api', 'api'], ['shippingUrl', 'data-shipping-url', 'shippingUrl'],
+    ['shippingEmail', 'data-shipping-email', 'shippingEmail'], ['onPaid', 'data-on-paid', 'KallubiPay.onPaid(fn)']];
 
   /* ------------------------------------------------------------------ the widget */
   function readConfig(node) {
@@ -3605,50 +3836,62 @@ var qrcode = function() {
     var confirmAboveFiat = cf == null ? DEFAULT_CONFIRM_ABOVE_FIAT : /^0+(\.0{1,2})?$/.test(cf) ? 0 : parseFiat(cf);
     if (confirmAboveFiatSet && confirmAboveFiat == null) { errs.push(['eConfFiat']); confirmAboveFiat = 0; }
     if (confirmAboveSet && (fiat || confirmAboveFiatSet)) errs.push(['eConfBoth']);
-    var urlOk = function (v) { return /^https:\/\/[^\s"'<>]+$|^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/[^\s"'<>]*$/.test(v); };
-    var nodeApi = d.node == null ? NODE_API : clean(d.node, 300).replace(/\/+$/, '');        // data-node="" disables the own node
-    if (nodeApi && !urlOk(nodeApi)) { if (window.console) console.warn('[Kallubi Pay] ignoring invalid data-node'); nodeApi = NODE_API; }
-    var fallback = d.fallback === '0' || d.fallback === 'false' ? '' : d.fallbackUrl ? clean(d.fallbackUrl, 300).replace(/\/+$/, '') : FALLBACK_API;
-    if (fallback && !urlOk(fallback)) { if (window.console) console.warn('[Kallubi Pay] ignoring invalid data-fallback-url'); fallback = FALLBACK_API; }
-    var api = clean(d.api, 300); if (api && !/^https:\/\/[^\s"'<>]+$|^\/[^\s"'<>]*$|^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\/[^\s"'<>]*$/.test(api)) { errs.push(['eApi']); api = ''; }
-    // v1.0.0 optional shipping address. Off by default; the extra attributes are only read when data-shipping="1".
-    var shipping = d.shipping === '1' || d.shipping === 'true', shipUrl = '', shipHost = '', shipMail = '';
-    if (shipping) {
-      shipUrl = clean(d.shippingUrl, 500);
-      if (shipUrl) { shipHost = shipUrlHost(shipUrl); if (!shipHost) { errs.push(['eShipUrl']); shipUrl = ''; shipHost = ''; } }
-      shipMail = clean(d.shippingEmail, 120);
-      if (shipMail && !isEmail(shipMail)) { errs.push(['eShipMail']); shipMail = ''; }
-    }
+    // v1.3.0 (trusted-config): URLs, callbacks and timing overrides are no longer read from the button markup (see trusted config above).
+    // Markup can still switch sources OFF (data-node="" / data-fallback="0"): that only weakens its own detection.
+    MOVED_ATTRS.forEach(function (a) {
+      if (node.hasAttribute(a[1]) && !(a[1] === 'data-node' && d.node === '')) warnOnce('moved-' + a[1], a[1] + ' on the button is ignored since v1.3.0: set ' + a[2] + ' via KallubiPay.config() (or on the <script> tag where supported)');
+    });
+    var nodeOff = d.node === '', fallbackOff = d.fallback === '0' || d.fallback === 'false';
+    if (script && !payeeAllowed(address)) errs.push(['eToNotAllowed']);
+    if (script && CFG.allowedTo == null) warnOnce('noallow', 'tip: add data-allowed-to="<your address>" to the <script> tag so injected buttons cannot pay to another address');
+    // v1.0.0 optional shipping address. Off by default. Destination (URL / e-mail) comes from the trusted config (v1.3.0).
+    var shipping = d.shipping === '1' || d.shipping === 'true';
     return {
       errors: errs, lang: pickLang(node), address: address, script: script, baseSats: baseSats, theme: theme,
       style: d.style === 'outline' ? 'outline' : 'gold', size: d.size === 'sm' ? 'sm' : '',
       label: clean(d.label, 80), merchant: clean(d.merchant, 60), order: orderId || clean(d.order, 40), orderId: orderId,
       fiat: fiat && fiatCents != null ? { cents: fiatCents, cur: cur } : null,
       text: clean(d.buttonText, 40), showAmount: d.showAmount === '1' || d.showAmount === 'true',
-      onPaid: clean(d.onPaid, 80), test: d.test === '1' || d.test === 'true',
-      unique: !(d.unique === '0' || d.unique === 'false'), ttl: ttl, api: api, node: nodeApi, fallback: fallback,
+      test: d.test === '1' || d.test === 'true', nodeOff: nodeOff, fallbackOff: fallbackOff,
+      unique: !(d.unique === '0' || d.unique === 'false'), ttl: ttl, api: '', node: '', fallback: '',
       testDelay: Math.max(500, Math.min(60000, Number(d.testDelay) || TEST_DELAY_MS)),
       testConfirmDelay: Math.max(500, Math.min(600000, Number(d.testConfirmDelay) || TEST_DELAY_MS)),
-      confirmAbove: confirmAbove, confirmAboveFiat: confirmAboveFiat, shipping: shipping, shipUrl: shipUrl, shipHost: shipHost, shipMail: shipMail,
+      confirmAbove: confirmAbove, confirmAboveFiat: confirmAboveFiat, shipping: shipping, shipUrl: '', shipHost: '', shipMail: '',
       pollMs: Math.max(1000, Math.min(60000, Math.round(Number(d.pollMs)) || POLL_MS)),
-      broadcasters: (function () {
-        var u = clean(d.broadcasterUrl, 300).replace(/\/+$/, '');
-        if (!u) return BROADCASTERS.slice();
-        if (!urlOk(u)) { if (window.console) console.warn('[Kallubi Pay] ignoring invalid data-broadcaster-url'); return BROADCASTERS.slice(); }
-        return [u];
-      })(),
-      quickMs: (function () {
-        var n = Math.round(Number(d.quickMs));
-        return n >= QUICK_MIN_MS && n <= 15000 ? n : QUICK_WATCH_MS;
-      })()
+      broadcasters: BROADCASTERS.slice(), quickMs: QUICK_WATCH_MS, markupErrors: errs.length
     };
   }
+  /** v1.3.0: copy the trusted settings (global CFG + this button's KallubiPay.mount options) into cfg. Runs at mount and
+   *  again when the dialog opens, so KallubiPay.config() calls made after the script loaded still apply. */
+  function applyTrusted(c, opts) {
+    var g = {}, k; for (k in CFG) g[k] = CFG[k];
+    opts = opts || {};
+    for (k in opts) if (k !== 'hooks' && k !== 'allowedTo' && Object.prototype.hasOwnProperty.call(opts, k)) g[k] = opts[k];
+    var errs = c.errors.slice(0, c.markupErrors);
+    if (c.script && !payeeAllowed(c.address, opts)) { if (!errs.some(function (e) { return e[0] === 'eToNotAllowed'; })) errs.push(['eToNotAllowed']); }
+    c.node = c.nodeOff ? '' : g.node;
+    c.fallback = c.fallbackOff ? '' : g.fallbackUrl;
+    c.broadcasters = g.broadcasterUrl ? [g.broadcasterUrl] : BROADCASTERS.slice();
+    c.quickMs = g.quickMs; c.api = g.api; c.acceptOverpay = !!g.acceptOverpay; c.rateSources = g.rateSources;
+    c.shippingInEvents = !!g.shippingInEvents; c.closedShadow = !!g.closedShadow;
+    c.shipUrl = ''; c.shipHost = ''; c.shipMail = '';
+    if (c.shipping) {
+      if (g.shippingUrl === '!bad') errs.push(['eShipUrl']); else if (g.shippingUrl) { c.shipUrl = g.shippingUrl; c.shipHost = shipUrlHost(g.shippingUrl) || ''; }
+      if (g.shippingEmail === '!bad') errs.push(['eShipMail']); else if (g.shippingEmail) c.shipMail = g.shippingEmail;
+    }
+    var changed = errs.length !== c.errors.length;
+    c.errors = errs;
+    return changed;
+  }
 
-  function Widget(node) {
-    this.node = node; this.cfg = readConfig(node); this.inv = null; this.modal = null; this.paid = null; this.ship = null;
+  function Widget(node, opts) {
+    this.node = node; this.opts = opts || {}; this.cfg = readConfig(node); this.inv = null; this.modal = null; this.paid = null; this.ship = null;
+    applyTrusted(this.cfg, this.opts);
     this.used = USED_TX; // txids that already paid an invoice on this page (any button): never counted twice
     this.host = el('span', { class: 'kallubi-pay-host' + (this.cfg.size ? ' sm' : '') });
-    this.root = this.host.attachShadow({ mode: 'open' });
+    // v1.3.0: closedShadow (trusted config) hides the widget internals from element.shadowRoot. This is defence in depth only:
+    // a script running on the shop page can still read events, hook DOM APIs or log keys. Default stays open (tests, a11y tools).
+    this.root = this.host.attachShadow({ mode: this.cfg.closedShadow ? 'closed' : 'open' });
     node.textContent = '';
     node.appendChild(this.host);
     this.render();
@@ -3688,7 +3931,7 @@ var qrcode = function() {
   Widget.prototype.loadThresholdFx = function (inv) {
     var self = this, c = this.cfg;
     if (!inv || c.test || (c.confirmAbove != null && !c.fiat)) return;   // test mode stays offline; explicit BSV threshold needs no rate
-    fetchRate('EUR', !!c.fallback).then(function (r) {
+    fetchRate('EUR', !!c.fallback, c.rateSources).then(function (r) {
       if (self.inv !== inv) return;
       attachFx(inv, { cur: 'EUR', micro: r.micro, rate: r.rate, source: r.source, ts: r.ts, usdRate: r.usdRate, ecbRate: r.ecbRate, ecbDate: r.ecbDate });
     }, function () {});
@@ -3698,7 +3941,7 @@ var qrcode = function() {
     if (!c.fiat) { this.newInvoice(); this.loadThresholdFx(this.inv); if (onReady) onReady(); this.showModal('waiting'); return; }
     var seq = this.quoteSeq = (this.quoteSeq || 0) + 1;
     this.quoting = true; this.showModal('quoting');
-    var rateP = fetchRate(c.fiat.cur, !!c.fallback);
+    var rateP = fetchRate(c.fiat.cur, !!c.fallback, c.rateSources);
     var ecbP = c.fiat.cur === 'USD' ? fetchEcb().then(null, function () { return null; }) : Promise.resolve(null);
     Promise.all([rateP, ecbP]).then(function (arr) {
       var r = arr[0], ecb = arr[1];
@@ -3717,6 +3960,7 @@ var qrcode = function() {
     });
   };
   Widget.prototype.open = function () {
+    if (!this.inv || this.inv.state === 'expired' || this.inv.state === 'dropped') { if (applyTrusted(this.cfg, this.opts)) this.render(); }
     if (this.cfg.errors.length) return;
     if (this.paid) { this.showModal('paid'); return; }
     if (this.inv && (this.inv.state === 'seen' || this.inv.state === 'checking')) { this.showModal(this.inv.state === 'checking' ? 'checking' : 'confirming'); return; }
@@ -3736,7 +3980,7 @@ var qrcode = function() {
   Widget.prototype.startWatch = function () {
     var self = this, inv = this.inv, c = this.cfg;
     this.stopWatch();
-    var o = { address: c.address, script: c.script, sats: inv.sats, since: inv.since, api: c.api, node: c.node, fallback: c.fallback, used: this.used };
+    var o = { address: c.address, script: c.script, sats: inv.sats, since: inv.since, api: c.api, node: c.node, fallback: c.fallback, used: this.used, acceptOverpay: c.acceptOverpay };
     inv.tick = setInterval(function () { self.tick(); }, 1000);
     if (c.test) {
       inv.testT = setTimeout(function () {
@@ -3751,6 +3995,7 @@ var qrcode = function() {
       if (!self.watching(inv)) return;
       w.step().then(function (m) {
         delay = POLL;
+        if (inv.noCheck && w.baseline) { inv.noCheck = false; self.refreshWaiting(inv); }
         if (m) {
           self.found(inv, m);
           // a match that was ignored (already counted for another invoice/button) must not end the watch
@@ -3761,6 +4006,7 @@ var qrcode = function() {
         inv.watcherFirst = true;
       }, function (e) {
         delay = Math.min(POLL_MAX_MS, delay * 2);     // back off on 429 / network errors
+        if (w.baselineErr && !w.baseline && !inv.noCheck) { inv.noCheck = true; self.refreshWaiting(inv); }
         schedule(delay);
       });
     };
@@ -3772,6 +4018,11 @@ var qrcode = function() {
     };
     loop();
   };
+  /** v1.3.0: redraw the waiting view (status line / overpaid note) if it is the one on screen */
+  Widget.prototype.refreshWaiting = function (inv) {
+    var v = this.modal && this.modal.dlg ? this.modal.dlg.getAttribute('data-view') : '';
+    if (this.inv === inv && v === 'waiting' && inv.state === 'waiting') this.showModal('waiting');
+  };
   /** v1.2.0: an invoice is watched while payable, and after expiry for LATE_WATCH_MS more (even if a new invoice was started),
    *  so a payment that arrives too late is flagged to the shop (kallubi:late) instead of being silently ignored. */
   Widget.prototype.watching = function (inv) {
@@ -3782,14 +4033,26 @@ var qrcode = function() {
   Widget.prototype.found = function (inv, m) {
     if (this.claimed && this.claimed[m.txid]) return;          // a tx counts for one invoice only
     if (this.used[m.txid]) return;                              // ... and on one button of the page only
+    if (m.overpaid) return this.onOverpaid(inv, m);             // v1.3.0 (exact-amount): more than the invoice is never "paid"
     if (inv.state === 'waiting' && this.inv === inv && Date.now() < inv.deadline) { this.claim(m.txid); return this.onMatch(m); }
     if (inv.state === 'waiting' && this.inv === inv) this.expire(inv);
     if (inv.state === 'expired' && Date.now() < inv.deadline + LATE_WATCH_MS) {
       // the tx would also pay the invoice that is open right now -> it belongs to that one (the buyer sees "paid", not "late")
       var cur = this.inv;
-      if (cur !== inv && cur && cur.state === 'waiting' && Date.now() < cur.deadline && Number(m.sats) >= cur.sats) return this.found(cur, m);
+      if (cur !== inv && cur && cur.state === 'waiting' && Date.now() < cur.deadline && amountMatch(Number(m.sats), cur.sats, this.cfg.acceptOverpay) === 'exact') return this.found(cur, m);
       this.claim(m.txid); return this.onLate(inv, m);
     }
+  };
+  /** v1.3.0 (exact-amount): a verified tx paid MORE than this invoice. It may be this buyer's (typed amount) or another buyer's payment
+   *  to the same address, so it is neither claimed nor "paid": the buyer sees a note to contact the shop, the shop gets
+   *  kallubi:overpaid, and the watch goes on for the exact amount. */
+  Widget.prototype.onOverpaid = function (inv, m) {
+    inv.over = inv.over || {};
+    if (inv.over[m.txid]) return;
+    inv.over[m.txid] = 1; inv.overpaid = { txid: m.txid, sats: m.sats };
+    var d = this.detail(m, inv); d.overpaid = true; d.late = inv.state !== 'waiting';
+    this.emit('kallubi:overpaid', d);
+    this.refreshWaiting(inv);
   };
   Widget.prototype.claim = function (txid) { (this.claimed = this.claimed || {})[txid] = 1; };
   Widget.prototype.onLate = function (inv, m) {
@@ -3940,7 +4203,7 @@ var qrcode = function() {
     if (c.test) { inv.confT = setTimeout(function () { if (self.inv === inv && inv.state === 'seen') self.onPaid({ txid: m.txid, sats: m.sats, confirmations: 1, test: true }); }, c.testConfirmDelay); return; }
     var every = Math.max(c.pollMs, Math.min(CONF_POLL_MS, c.pollMs * 3)), delay = every;
     // confirmations come from the node / fallback status; the worker list is only used when no chain source is configured
-    var api = c.api && !c.node && !c.fallback ? new ApiWatcher({ address: c.address, sats: inv.sats, since: inv.since, api: c.api }) : null;
+    var api = c.api && !c.node && !c.fallback ? new ApiWatcher({ address: c.address, sats: inv.sats, since: inv.since, api: c.api, acceptOverpay: true }) : null;
     if (api) api.baseline = {};
     var misses = 0;
     var check = function () {
@@ -3975,8 +4238,25 @@ var qrcode = function() {
     if (this.modal) this.showModal('dropped');
     this.emit('kallubi:dropped', this.detail(m));
   };
+  /** DOM event (bubbles, composed: page scripts and tag managers see it) + the registered callbacks (shop JavaScript).
+   *  v1.3.0: the buyer's shipping address is no longer put into the bubbling DOM events (generic document-level listeners,
+   *  analytics or tag managers would see it). Events carry shippingProvided: true instead; the full address goes to the
+   *  callbacks (KallubiPay.onPaid / on('shipping', fn) / mount options), to data-shipping-url and the e-mail draft.
+   *  shippingInEvents: true (trusted config) restores the v1.2 behaviour. */
   Widget.prototype.emit = function (name, detail) {
-    try { this.node.dispatchEvent(new CustomEvent(name, { detail: detail, bubbles: true, composed: true })); } catch (e) {}
+    var pub = detail, k;
+    if (detail && detail.shipping !== undefined && !this.cfg.shippingInEvents) {
+      pub = {}; for (k in detail) if (k !== 'shipping') pub[k] = detail[k];
+      pub.shippingProvided = !!detail.shipping;
+    }
+    try { this.node.dispatchEvent(new CustomEvent(name, { detail: pub, bubbles: true, composed: true })); } catch (e) {}
+    var short = name.replace(/^kallubi:/, ''), fns = [].concat(HOOKS[short] || []), own = this.opts && this.opts.hooks && this.opts.hooks[short];
+    if (typeof own === 'function') fns.push(own);
+    var node = this.node, json = null;
+    try { json = JSON.stringify(detail); } catch (e) { json = null; }
+    fns.forEach(function (fn) {
+      try { fn.call(node, json ? JSON.parse(json) : detail, node); } catch (e) { if (window.console) console.error(e); }
+    });
   };
   Widget.prototype.onPaid = function (m) {
     var inv = this.inv, c = this.cfg;
@@ -3985,11 +4265,8 @@ var qrcode = function() {
     this.paid = { txid: m.txid, sats: m.sats, confirmations: detail.confirmations, test: !!m.test };
     this.render();
     this.showModal('paid');
+    // v1.3.0 (trusted-config): callbacks come from KallubiPay.onPaid(fn) / config / mount options (see emit); data-on-paid is ignored
     this.emit('kallubi:paid', detail);
-    if (c.onPaid && /^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*$/.test(c.onPaid)) {
-      var fn = c.onPaid.split('.').reduce(function (o, k) { return o && Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined; }, window);
-      if (typeof fn === 'function') { try { fn.call(this.node, detail); } catch (e) { if (window.console) console.error(e); } }
-    }
   };
 
   /* ------------------------------------------------------------------ v1.0.0 shipping address (data-shipping="1")
@@ -4125,7 +4402,7 @@ var qrcode = function() {
     if (!this.modal) {
       var host = el('div', { class: 'kp-modal-host', 'data-kallubi-modal': '' });
       host.className = 'kp-modal-host';
-      var sr = host.attachShadow({ mode: 'open' });
+      var sr = host.attachShadow({ mode: c.closedShadow ? 'closed' : 'open' });
       var onKey = function (e) { if (e.key === 'Escape') { e.stopPropagation(); self.close(); } else if (e.key === 'Tab') self.trap(e); };
       this.modal = { host: host, sr: sr, onKey: onKey, prevFocus: document.activeElement };
       document.addEventListener('keydown', onKey, true);
@@ -4184,14 +4461,17 @@ var qrcode = function() {
     this.timerEl = el('div', { class: 'timer', 'aria-label': t('timeLeft') });
     this.barEl = el('i');
     var wait = el('div', { class: 'wait', role: 'status', 'aria-live': 'polite' }, [el('div', { class: 'spin' }),
-      el('div', {}, [el('div', { class: 'w1', text: t('waiting') }), el('div', { class: 'w2', text: c.test ? t('testSoon') : t('auto') })]), this.timerEl]);
+      el('div', {}, [el('div', { class: 'w1', text: t('waiting') }), el('div', { class: 'w2' + (inv.noCheck ? ' warn' : ''), 'data-nocheck': inv.noCheck ? '' : null,
+        text: c.test ? t('testSoon') : inv.noCheck ? t('noCheck') : t('auto') })]), this.timerEl]);
+    var over = inv.overpaid ? el('div', { class: 'note warn', role: 'alert', 'data-overpaid': inv.overpaid.txid,
+      text: t('overpaid', { a: fmtBsv(inv.overpaid.sats), tx: short(inv.overpaid.txid, 8, 8) }) }) : null;
     var shiprow = null;
     if (c.shipping && this.ship) {
       var ed = el('button', { type: 'button', class: 'lnk', text: t('edit') });
       ed.addEventListener('click', function () { self.showModal('shipping'); });
       shiprow = el('div', { class: 'shiprow' }, [el('span', { text: t('shipTo') + ':' }), el('span', { class: 'sv', title: shipSummary(this.ship), text: shipSummary(this.ship) }), ed]);
     }
-    return el('div', { class: 'mbody' }, [amt, qr, addr, open, wait, el('div', { class: 'bar' }, [this.barEl]), shiprow]);
+    return el('div', { class: 'mbody' }, [amt, qr, addr, open, wait, el('div', { class: 'bar' }, [this.barEl]), over, shiprow]);
   };
   Widget.prototype.viewPaid = function () {
     var self = this, c = this.cfg, p = this.paid, t = this.t.bind(this);
@@ -4298,24 +4578,55 @@ var qrcode = function() {
 
   /* ------------------------------------------------------------------ mount */
   var mounted = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
-  function mount(node) {
-    if (!node || node.nodeType !== 1 || (mounted && mounted.has(node))) return mounted && mounted.get(node);
-    var w = new Widget(node); if (mounted) mounted.set(node, w); return w;
+  /** KallubiPay.mount(el, opts): explicit mount from the shop's JavaScript. opts are trusted per-button settings
+   *  (same keys as KallubiPay.config, plus onPaid / onSeen / ... callbacks; allowedTo can only narrow the global list). */
+  function mount(node, opts) {
+    if (!node || node.nodeType !== 1 || (typeof Element !== 'undefined' && !(node instanceof Element))) return null;
+    if (mounted && mounted.has(node)) return mounted.get(node);
+    var w = new Widget(node, trustedPart(opts || {}, 'mount options')); if (mounted) mounted.set(node, w); return w;
   }
-  function scan(root) { Array.prototype.forEach.call((root || document).querySelectorAll('[data-kallubi-pay]'), mount); }
+  function autoMount(node) { if (inScope(node)) mount(node); }
+  /** v1.3.0: with a mount scope (data-mount="#checkout" on the script tag, or config mount) auto-mount only takes buttons
+   *  inside the matching container(s), so a button pasted into reviews or comments elsewhere on the page stays inert. */
+  function inScope(node) {
+    if (!CFG.mountScope) return true;
+    try { return !!(node.closest && node.closest(CFG.mountScope)); } catch (e) { return false; }
+  }
+  function scan(root) { Array.prototype.forEach.call((root || document).querySelectorAll('[data-kallubi-pay]'), function (n) { mount(n); }); }
+  function autoScan(root) { Array.prototype.forEach.call((root || document).querySelectorAll('[data-kallubi-pay]'), autoMount); }
+  var started = false;
   function start() {
-    scan();
+    if (started || !CFG.autoMount) return;
+    started = true;
+    autoScan();
     if (typeof MutationObserver !== 'undefined') new MutationObserver(function (ms) {
+      if (!CFG.autoMount) return;
       ms.forEach(function (m) { Array.prototype.forEach.call(m.addedNodes, function (n) {
-        if (n.nodeType !== 1) return; if (n.hasAttribute('data-kallubi-pay')) mount(n); else if (n.querySelector) scan(n); }); });
+        if (n.nodeType !== 1) return; if (n.hasAttribute('data-kallubi-pay')) autoMount(n); else if (n.querySelector) autoScan(n); }); });
     }).observe(document.documentElement, { childList: true, subtree: true });
   }
+  /** KallubiPay.config({...}): trusted page-wide settings (see README). Returns a copy of the effective settings. */
+  function config(o) {
+    if (o != null) {
+      if (!isPlain(o)) { warnOnce('cfgobj', 'KallubiPay.config() needs a plain object'); }
+      else applyGlobal(trustedPart(o, 'KallubiPay.config'));
+    }
+    var out = {}, k; for (k in CFG) out[k] = Array.isArray(CFG[k]) ? CFG[k].slice() : CFG[k];
+    return out;
+  }
 
-  window.KallubiPay = {
-    version: VERSION, mount: mount, scan: scan,
+  var API = {
+    version: VERSION, mount: mount, scan: scan, config: config,
+    onPaid: function (fn) { return addHook('paid', fn); },
+    on: function (name, fn) { return addHook(String(name || '').replace(/^kallubi:/, ''), fn); },
     // exposed for tests / advanced use (pure functions, no side effects)
     languages: LANGS.slice(),
-    util: { pickLang: pickLang, normLang: normLang, t: tr, strings: function (l) { var o = {}, k, tab = I18N[normLang(l) || 'en']; for (k in tab) o[k] = tab[k]; return o; }, inspectAddress: inspectAddress, addressScript: addressScript, addressError: addressError, isEmail: isEmail, shipUrlHost: shipUrlHost, parseAmount: parseAmount, amountError: amountError, parseThreshold: parseThreshold, fmtBsv: fmtBsv, matchTx: matchTx, Watcher: Watcher, verifiedSats: verifiedSats, txOutputs: function (hex) { return txOutputs(hexBytes(hex)); }, txidOf: function (hex) { var b = hexBytes(hex); return b ? txidOf(b) : null; }, parseFiat: parseFiat, parseOrderId: parseOrderId, rateMicro: rateMicro, fiatToSats: fiatToSats, checkRate: checkRate, fmtFiat: fmtFiat, genRef: genRef, parseEcbCsv: parseEcbCsv, checkEcb: checkEcb, parseTx: function (hex) { var b = hexBytes(hex); if (!b) return null; try { var t = parseTx(b); return { version: t.version, inputs: t.inputs.map(function (x) { return { prevTxid: x.prevTxid, vout: x.vout, sequence: x.sequence }; }), outputs: t.outputs.map(function (x) { return { value: x.value, script: toHex(x.script) }; }), locktime: t.locktime, size: t.size }; } catch (e) { return null; } }, isTxFinal: isTxFinal, feeSufficient: feeSufficient, eurToUsdCents: eurToUsdCents, eurToSatsFloor: eurToSatsFloor, zeroConfLimits: zeroConfLimits, needsBlockConf: needsBlockConf, withinFallback: withinFallback, toEf: toEf, sha256hex: function (u8) { return toHex(sha256(u8)); } }
+    util: { pickLang: pickLang, normLang: normLang, t: tr, strings: function (l) { var o = {}, k, tab = I18N[normLang(l) || 'en']; for (k in tab) o[k] = tab[k]; return o; }, inspectAddress: inspectAddress, addressScript: addressScript, addressError: addressError, isEmail: isEmail, shipUrlHost: shipUrlHost, parseAmount: parseAmount, amountError: amountError, parseThreshold: parseThreshold, fmtBsv: fmtBsv, matchTx: matchTx, Watcher: Watcher, verifiedSats: verifiedSats, txOutputs: function (hex) { return txOutputs(hexBytes(hex)); }, txidOf: function (hex) { var b = hexBytes(hex); return b ? txidOf(b) : null; }, parseFiat: parseFiat, parseOrderId: parseOrderId, rateMicro: rateMicro, fiatToSats: fiatToSats, checkRate: checkRate, fmtFiat: fmtFiat, genRef: genRef, parseEcbCsv: parseEcbCsv, checkEcb: checkEcb, ratesAgree: ratesAgree, pickRate: pickRate, amountMatch: amountMatch, parseAllowed: parseAllowed, maxTxHex: MAX_TX_HEX, verifiedSatsAsync: verifiedSatsAsync, parseTx: function (hex) { var b = hexBytes(hex); if (!b) return null; try { var t = parseTx(b); return { version: t.version, inputs: t.inputs.map(function (x) { return { prevTxid: x.prevTxid, vout: x.vout, sequence: x.sequence }; }), outputs: t.outputs.map(function (x) { return { value: x.value, script: toHex(x.script) }; }), locktime: t.locktime, size: t.size }; } catch (e) { return null; } }, isTxFinal: isTxFinal, feeSufficient: feeSufficient, eurToUsdCents: eurToUsdCents, eurToSatsFloor: eurToSatsFloor, zeroConfLimits: zeroConfLimits, needsBlockConf: needsBlockConf, withinFallback: withinFallback, toEf: toEf, sha256hex: function (u8) { return toHex(sha256(u8)); } }
   };
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
+  Object.freeze(API.util); Object.freeze(API.languages); Object.freeze(API);
+  try { Object.defineProperty(window, 'KallubiPay', { value: API, writable: false, configurable: false, enumerable: true }); }
+  catch (e) { window.KallubiPay = API; }
+  // v1.3.0: auto-mount runs at DOMContentLoaded (or on the next task when the page is already parsed), so a
+  // KallubiPay.config() call right after this script tag still applies to the first buttons.
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else setTimeout(start, 0);
 })();

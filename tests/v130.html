@@ -1,0 +1,5 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Kallubi Pay v1.3.0 – test fixture (no script-tag settings)</title></head>
+<body><div id="slot"></div>
+<script src="../dist/button.min.js"></script>
+<script>window.__ev=[];['kallubi:paid','kallubi:seen','kallubi:dropped','kallubi:overpaid','kallubi:shipping','kallubi:late','kallubi:expired'].forEach(function(n){document.addEventListener(n,function(e){window.__ev.push({type:n,d:e.detail,id:(e.target.closest&&e.target.closest('[id]')||{}).id})})});</script>
+</body></html>
